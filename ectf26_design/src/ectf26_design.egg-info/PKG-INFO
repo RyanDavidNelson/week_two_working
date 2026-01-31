@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: ectf26_design
+Version: 2026.0+example
+Requires-Python: >=3.12
+Requires-Dist: loguru
