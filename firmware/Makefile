@@ -54,7 +54,7 @@ NAME = hsm
 
 CFLAGS += -I.. \
     -D__MSPM0L2228__ \
-    -O2 \
+    -O0 \
     "-I$(MSPM0_SDK_INSTALL_DIR)/source/third_party/CMSIS/Core/Include" \
     "-I$(MSPM0_SDK_INSTALL_DIR)/source" \
 	"-I./inc" \

@@ -1,6 +1,6 @@
 # UTD's MITRE eCTF Design
 
-This repository holds UT Dallas's design for the 2026 MITRE eCTF. We are working to secure the insecure example design for an eCTF Hardware Security Module provided by MITRE.
+This repository holds UT Dallas's design for the 2026 MITRE eCTF. We are working to secure the insecure example design for a Hardware Security Module provided by MITRE.
 
 The rules for the 2026 eCTF can be found here: https://rules.ectf.mitre.org/.
 
@@ -19,4 +19,4 @@ The rules for the 2026 eCTF can be found here: https://rules.ectf.mitre.org/.
         - `gen_secrets.py` - Generates shared secrets
     - `pyproject.toml` - File that tells pip how to install this module
 - `Makefile` - Helper script to simplify repetitive build steps
-- 'design_documentation' - Design Document, Timeline, and Task List for Team Organization
+- `design_documentation/` - Design Document, Timeline, and Task List for Team Organization

@@ -1,8 +1,7 @@
 /**
  * @file security.h
- * @brief Security primitives header for eCTF HSM
+ * @brief Security primitives for eCTF HSM
  * @date 2026
- *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 
@@ -13,24 +12,20 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/*
- * Constants
- */
 #define MAX_PERMS 8
 #define PIN_LENGTH 6
 
-/*
- * Permission types - uppercase to match protocol
- */
+/* Default cycles per millisecond at 32MHz */
+#ifndef CYCLES_PER_MS
+#define CYCLES_PER_MS 32000
+#endif
+
 typedef enum {
     PERM_READ = 'R',
     PERM_WRITE = 'W',
     PERM_RECEIVE = 'C',
 } permission_enum_t;
 
-/*
- * Permission structure
- */
 typedef struct {
     uint16_t group_id;
     bool read;
@@ -38,13 +33,11 @@ typedef struct {
     bool receive;
 } group_permission_t;
 
-/*
- * TRNG Functions
- */
+/* TRNG Functions */
 
 /**
- * @brief Initialize the hardware TRNG
- * @return 0 on success, -1 on failure
+ * @brief Initialize hardware TRNG
+ * @return 0 on success, negative error code on failure
  */
 int trng_init(void);
 
@@ -60,34 +53,45 @@ uint32_t trng_read_word(void);
  */
 uint8_t trng_read_byte(void);
 
-/**
- * @brief Fill a buffer with random bytes
- * @param buf Buffer to fill
- * @param len Number of bytes to fill
- * @return 0 on success, -1 on failure
- */
-int trng_fill_buffer(uint8_t *buf, size_t len);
-
-/*
- * Core Security Functions
- */
+/* Timing Functions */
 
 /**
- * @brief Validate a pin against the HSM's pin
- *
- * @param pin Requested pin to validate.
- *
- * @return True if the pin is valid. False if not.
+ * @brief Precise cycle-accurate delay using assembly
+ * @param cycles Number of CPU cycles to delay
+ * 
+ * Based on TI SDK dl_common.c implementation.
+ * At 32MHz: 32000 cycles ≈ 1ms
+ */
+void delay_cycles(uint32_t cycles);
+
+/**
+ * @brief Delay in milliseconds
+ * @param ms Milliseconds to wait
+ */
+void delay_ms(uint32_t ms);
+
+/**
+ * @brief Random delay for glitch resistance
+ * 
+ * Delays a random number of cycles (0 to ~4ms) using TRNG.
+ * Used between security-critical operations to prevent timing and glitch attacks.
+ */
+void random_delay(void);
+
+/* Authentication Functions */
+
+/**
+ * @brief Validate PIN against stored HSM PIN
+ * @param pin 6-byte PIN to validate
+ * @return true if valid, false otherwise (with 5s delay on failure)
  */
 bool check_pin(unsigned char *pin);
 
 /**
- * @brief Ensure the HSM has the requested permission
- *
- * @param group_id Group ID.
- * @param perm Permission type.
- *
- * @return True if the HSM has the correct permission. False if not.
+ * @brief Check if HSM has permission for group
+ * @param group_id Group ID to check
+ * @param perm Permission type (PERM_READ, PERM_WRITE, PERM_RECEIVE)
+ * @return true if permission granted
  */
 bool validate_permission(uint16_t group_id, permission_enum_t perm);
 
@@ -95,67 +99,36 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm);
  * @brief Constant-time memory comparison
  * @param a First buffer
  * @param b Second buffer
- * @param len Length to compare
- * @return true if buffers are equal, false otherwise
+ * @param len Bytes to compare
+ * @return true if equal
  */
 bool secure_compare(const void *a, const void *b, size_t len);
 
-/*
- * Input Validation Functions
- */
+/* Input Validation Functions */
 
 /**
- * @brief Validate file slot number
- * @param slot Slot number to validate
- * @return true if slot is valid (0 to MAX_FILE_COUNT-1)
+ * @brief Validate file slot number (0 to MAX_FILE_COUNT-1)
  */
 bool validate_slot(uint8_t slot);
 
 /**
- * @brief Validate filename string
- * @param name Filename to validate
- * @param max_len Maximum allowed length
- * @return true if name is valid (printable ASCII, null-terminated)
+ * @brief Validate filename (printable ASCII, null-terminated)
  */
 bool validate_name(const char *name, size_t max_len);
 
 /**
- * @brief Validate permission count
- * @param count Permission count to validate
- * @return true if count is valid (0 to MAX_PERMS)
+ * @brief Validate permission count (0 to MAX_PERMS)
  */
 bool validate_perm_count(uint8_t count);
 
 /**
- * @brief Validate contents length
- * @param len Length to validate
- * @return true if length is valid (0 to MAX_CONTENTS_SIZE)
+ * @brief Validate file contents length (0 to MAX_CONTENTS_SIZE)
  */
 bool validate_contents_len(uint16_t len);
 
 /**
- * @brief Validate boolean value
- * @param value Value to validate
- * @return true if value is 0 or 1
+ * @brief Validate boolean value (0 or 1)
  */
 bool validate_bool(uint8_t value);
 
-/*
- * Memory Safety Functions
- */
-
-/**
- * @brief Secure memory clear (won't be optimized away)
- * @param ptr Pointer to memory to clear
- * @param len Number of bytes to clear
- */
-void explicit_bzero(void *ptr, size_t len);
-
-/**
- * @brief Busy-wait delay in milliseconds
- * @param ms Milliseconds to wait
- * @note Uses CYCLES_PER_MS for timing - calibrate for your hardware
- */
-void busy_wait_ms(uint32_t ms);
-
-#endif  /* __SECURITY_H__ */
+#endif /* __SECURITY_H__ */

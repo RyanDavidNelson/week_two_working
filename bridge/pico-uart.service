@@ -1,0 +1,22 @@
+[Unit]
+Description=Raspberry Pi Pico UART Stream Service
+Documentation=man:pico_uart_service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/work/2026-ectf-utd/bridge/pico_uart_service.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pico-uart
+
+# Run as root to access serial ports and create pipes
+User=root
+
+# Device access
+DevicePolicy=auto
+
+[Install]
+WantedBy=multi-user.target
