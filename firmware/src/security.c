@@ -53,6 +53,26 @@ void random_delay(void)
 }
 
 /*
+ * Memory Functions
+ */
+
+void secure_zero(void *ptr, size_t len)
+{
+    volatile uint8_t *p = (volatile uint8_t *)ptr;
+
+    for (size_t i = 0; i < len; i++) {
+        p[i] = 0;
+    }
+}
+
+void halt(void)
+{
+    while (1) {
+        __asm volatile("nop");
+    }
+}
+
+/*
  * Hardware TRNG Functions
  */
 

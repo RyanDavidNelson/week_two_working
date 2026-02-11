@@ -37,24 +37,27 @@
 - Permissions set at build time, immutable at runtime
 
 **SR4: Data integrity**
-- Files must be authenticated
-- File transfers must be authenticated 
+- Files must be authenticated (GCM tag)
+- File transfers must be authenticated (GCM tag + challenge binding)
 
 **SR5: Data confidentiality**
-- Files encrypted at rest
-- Files encrypted in transit
+- Files encrypted at rest (AES-256-GCM)
+- Files encrypted in transit (AES-256-GCM)
 
 ---
 
 ## Cryptographic Architecture
 
-**Keys (generated per deployment, stored in hardware KEYSTORE):**
+**Keys:**
 
-| Key | Size | Slot | Purpose |
-|-----|------|------|---------|
-| AES_KEY | 256-bit | 0 | File encryption (AES-256-CBC) |
-| HMAC_KEY | 256-bit | 1 | File/transfer integrity (HMAC-SHA256) |
-| AUTH_KEY | 256-bit | 2 | Device authentication, permission binding |
+| Key | Size | Storage | Purpose |
+|-----|------|---------|---------|
+| GCM_KEY | 256-bit | KEYSTORE slot 0 | File encryption + integrity (AES-256-GCM) |
+| AUTH_KEY | 256-bit | Flash (secrets.h) | Challenge-response authentication, permission binding |
+
+**Key storage rationale:**
+- GCM_KEY in KEYSTORE: Hardware write-only protection, feeds directly to AESADV
+- AUTH_KEY in flash: wolfcrypt HMAC requires key in RAM; KEYSTORE cannot export keys
 
 **Per-HSM secrets (computed at build time):**
 
@@ -66,52 +69,149 @@
 PIN stored in firmware flash (secrets.h). KEYSTORE is write-only; cannot store PIN there.
 
 **Algorithms:**
-- Encryption: AES-256-CBC (hardware AESADV)
-- Integrity: HMAC-SHA256
-- Authentication: HMAC-SHA256 challenge-response
-- IV/Nonce: Hardware TRNG
-- Padding: PKCS#7
+- Encryption + Integrity: AES-256-GCM (hardware AESADV, single pass)
+- Authentication: HMAC-SHA256 (wolfcrypt library)
+- Nonce: 12-byte from hardware TRNG (96-bit, sufficient for eCTF scale)
+- No padding required (GCM is stream mode)
+
+**Why GCM over CBC + HMAC:**
+1. Single-pass authenticated encryption (faster, simpler)
+2. Hardware tag verification (constant-time, no software timing leak)
+3. AAD binds metadata without encryption overhead
+4. No padding oracle vulnerabilities
+
+---
+
+## File Storage
+
+**Storage layout:**
+
+```
+FAT entry (at 0x3A000):
+| uuid[16] | length[2] | padding[2] | flash_addr[4] |
+
+File metadata (firmware managed):
+| slot[1] | group_id[2] | name[32] | uuid[16] |
+
+Encrypted file data (at flash_addr):
+| nonce[12] | ciphertext[contents_len] | tag[16] |
+```
+
+**GCM parameters for file storage:**
+- Key: GCM_KEY from KEYSTORE slot 0
+- Nonce: 12 bytes from TRNG (stored with file)
+- AAD: slot || uuid || group_id || name (authenticated, not encrypted)
+- Plaintext: file contents only
+- Tag: 128-bit (full length, no truncation)
+
+**Write operation:**
+```
+1. Validate inputs (slot, group_id, name, contents_len)
+2. Verify WRITE permission for group_id
+3. Generate 12-byte nonce via TRNG
+4. Construct AAD = slot || uuid || group_id || name
+5. (ciphertext, tag) = AES-256-GCM-Encrypt(GCM_KEY, nonce, AAD, contents)
+6. Store metadata + nonce || ciphertext || tag to flash
+7. Update FAT with uuid, length, address
+```
+
+**Read operation:**
+```
+1. Verify slot < MAX_FILE_COUNT and slot in use
+2. Load metadata, extract group_id
+3. Verify READ permission for group_id
+4. Load encrypted data (nonce, ciphertext, tag)
+5. Reconstruct AAD = slot || uuid || group_id || name
+6. plaintext = AES-256-GCM-Decrypt(GCM_KEY, nonce, AAD, ciphertext, tag)
+7. If tag verification fails → treat as corrupted, return error
+8. Verify loaded group_id matches permission-checked group_id (TOCTOU defense)
+9. Return name + plaintext contents
+10. explicit_bzero() all sensitive buffers
+```
+
+**Integrity failure handling:** 
+If GCM tag verification fails, treat slot as empty/corrupted. Do not reveal which check failed.
 
 ---
 
 ## Protocol: File Transfer (RECEIVE_MSG)
 
-**Requester (Receiver):**
+**Message flow:**
 ```
-1. Verify local RECEIVE permission exists for at least one group
-2. Generate 16-byte receiver_challenge (TRNG)
-3. Send RECEIVE_REQUEST: requested_slot || receiver_challenge
-4. Receive sender_challenge from sender
-5. Compute response = HMAC(AUTH_KEY, sender_challenge || requested_slot || permissions)
-6. Send perm_count || permissions || permission_mac || response
-7. Receive sender_auth || uuid || file_group_id || iv || ciphertext || file_hmac || transfer_mac
-8. Verify sender_auth = HMAC(AUTH_KEY, receiver_challenge)
-9. Verify local RECEIVE permission for file_group_id
-10. Verify transfer_mac = HMAC(HMAC_KEY, requested_slot || uuid || file_group_id || iv || sender_challenge || ciphertext || file_hmac)
-11. Verify file_hmac matches HMAC(HMAC_KEY, requested_slot || uuid || iv || file_group_id || name || len || ciphertext)
-12. Generate new_iv (TRNG)
-13. Decrypt ciphertext with original iv, re-encrypt with new_iv
-14. Compute new_hmac = HMAC(HMAC_KEY, write_slot || uuid || new_iv || file_group_id || name || len || new_ciphertext)
-15. Write to flash with uuid (preserve original UUID in FAT)
+    Receiver                              Sender
+       |                                    |
+       |-- RECEIVE_REQUEST ---------------->|
+       |   slot || receiver_challenge       |
+       |                                    |
+       |<------------ CHALLENGE_RESPONSE ---|
+       |              sender_challenge ||   |
+       |              sender_auth           |
+       |                                    |
+       |-- PERMISSION_PROOF --------------->|
+       |   receiver_auth || perm_count ||   |
+       |   permissions || permission_mac    |
+       |                                    |
+       |<------------------- FILE_DATA -----|
+       |   nonce || ciphertext || tag       |
+       |   (AAD includes both challenges)   |
+       |                                    |
 ```
 
-**Sender:**
+**Receiver (Requester):**
+```
+1. Verify local RECEIVE permission exists for at least one group
+2. Generate 12-byte receiver_challenge (TRNG)
+3. Send RECEIVE_REQUEST: requested_slot || receiver_challenge
+
+4. Receive CHALLENGE_RESPONSE: sender_challenge || sender_auth
+5. Verify sender_auth = HMAC(AUTH_KEY, receiver_challenge || "sender")
+
+6. Compute receiver_auth = HMAC(AUTH_KEY, sender_challenge || "receiver")
+7. Send PERMISSION_PROOF: receiver_auth || perm_count || permissions || permission_mac
+
+8. Receive FILE_DATA: nonce || ciphertext || tag
+9. Construct AAD = receiver_challenge || sender_challenge || requested_slot || uuid || group_id
+10. plaintext = AES-256-GCM-Decrypt(GCM_KEY, nonce, AAD, ciphertext, tag)
+11. If tag fails → abort (sender not authentic or data tampered)
+12. Verify local RECEIVE permission for group_id
+13. Generate new_nonce for local storage
+14. Construct storage_AAD = write_slot || uuid || group_id || name
+15. Re-encrypt: (new_ciphertext, new_tag) = AES-256-GCM-Encrypt(GCM_KEY, new_nonce, storage_AAD, plaintext)
+16. Store to flash with original UUID
+```
+
+**Sender (Responder via LISTEN):**
 ```
 1. Receive RECEIVE_REQUEST: requested_slot || receiver_challenge
 2. Validate requested_slot < MAX_FILE_COUNT and slot in use
-3. Read file metadata, extract file_group_id and uuid
-4. Generate 16-byte sender_challenge (TRNG)
-5. Send sender_challenge
-6. Receive perm_count || permissions || permission_mac || response (2000ms timeout)
-7. Validate perm_count <= MAX_PERMS
-8. Verify permission_mac = HMAC(AUTH_KEY, perm_count || permissions)
-9. Verify response = HMAC(AUTH_KEY, sender_challenge || requested_slot || permissions)
-10. Iterate permissions[0..perm_count-1], check RECEIVE exists for file_group_id
-11. Compute sender_auth = HMAC(AUTH_KEY, receiver_challenge)
-12. Load encrypted file (iv, ciphertext, file_hmac) from flash
-13. Compute transfer_mac = HMAC(HMAC_KEY, requested_slot || uuid || file_group_id || iv || sender_challenge || ciphertext || file_hmac)
-14. Send sender_auth || uuid || file_group_id || iv || ciphertext || file_hmac || transfer_mac
+3. Load file metadata (uuid, group_id, name)
+
+4. Generate 12-byte sender_challenge (TRNG)
+5. Compute sender_auth = HMAC(AUTH_KEY, receiver_challenge || "sender")
+6. Send CHALLENGE_RESPONSE: sender_challenge || sender_auth
+
+7. Receive PERMISSION_PROOF: receiver_auth || perm_count || permissions || permission_mac (2000ms timeout)
+8. Validate perm_count <= MAX_PERMS
+9. Verify permission_mac = HMAC(AUTH_KEY, perm_count || serialized_permissions)
+10. Verify receiver_auth = HMAC(AUTH_KEY, sender_challenge || "receiver")
+11. Iterate permissions[0..perm_count-1], verify RECEIVE exists for file's group_id
+12. If any check fails → abort with generic error
+
+13. Load encrypted file from flash (stored_nonce, ciphertext, stored_tag)
+14. Decrypt locally to get plaintext (verify stored file integrity)
+15. Generate transfer_nonce (TRNG)
+16. Construct transfer_AAD = receiver_challenge || sender_challenge || requested_slot || uuid || group_id
+17. (transfer_ciphertext, transfer_tag) = AES-256-GCM-Encrypt(GCM_KEY, transfer_nonce, transfer_AAD, plaintext)
+18. Send FILE_DATA: transfer_nonce || transfer_ciphertext || transfer_tag
 ```
+
+**Security properties:**
+- Mutual authentication: Both parties prove knowledge of AUTH_KEY via HMAC
+- Replay protection: Fresh challenges included in GCM AAD
+- Permission verification: Sender checks receiver's RECEIVE permission before sending
+- Integrity: GCM tag covers challenges + metadata + contents
+- Confidentiality: Contents encrypted with GCM_KEY
+- Slot binding: requested_slot in AAD prevents misdirection
 
 ---
 
@@ -119,104 +219,66 @@ PIN stored in firmware flash (secrets.h). KEYSTORE is write-only; cannot store P
 
 **Requester:**
 ```
-1. Send INTERROGATE_MSG: perm_count || permissions || permission_mac
-2. Receive challenge from sender
-3. Send response = HMAC(AUTH_KEY, challenge || permissions)
-4. Receive filtered_file_list || list_mac
-5. Verify list_mac = HMAC(AUTH_KEY, challenge || filtered_file_list)
+1. Generate 12-byte challenge (TRNG)
+2. Compute auth = HMAC(AUTH_KEY, challenge || "interrogate_req")
+3. Send INTERROGATE_REQUEST: challenge || auth || perm_count || permissions || permission_mac
+4. Receive INTERROGATE_RESPONSE: response_auth || filtered_list
+5. Verify response_auth = HMAC(AUTH_KEY, challenge || filtered_list || "interrogate_resp")
+6. Return filtered_list to host
 ```
 
-**Sender:**
+**Responder:**
 ```
-1. Receive INTERROGATE_MSG: perm_count || permissions || permission_mac
+1. Receive INTERROGATE_REQUEST: challenge || auth || perm_count || permissions || permission_mac
 2. Validate perm_count <= MAX_PERMS
-3. Verify permission_mac = HMAC(AUTH_KEY, perm_count || permissions)
-4. Generate 16-byte challenge (TRNG)
-5. Send challenge
-6. Receive response (2000ms timeout)
-7. Verify response = HMAC(AUTH_KEY, challenge || permissions)
-8. Filter file_list: include only files where permissions[0..perm_count-1] has RECEIVE for file's group_id
-9. Send filtered_file_list || HMAC(AUTH_KEY, challenge || filtered_file_list)
+3. Verify permission_mac = HMAC(AUTH_KEY, perm_count || serialized_permissions)
+4. Verify auth = HMAC(AUTH_KEY, challenge || "interrogate_req")
+5. Filter file_list: include only files where requester has RECEIVE for file's group_id
+6. Compute response_auth = HMAC(AUTH_KEY, challenge || filtered_list || "interrogate_resp")
+7. Send INTERROGATE_RESPONSE: response_auth || filtered_list
 ```
 
 ---
 
-## File Storage
+## Data Structures
 
-**file_t structure (extended for encryption):**
+**file_t structure:**
 ```c
 #pragma pack(push, 1)
 typedef struct {
-    uint32_t in_use;
-    slot_t slot;
-    uint8_t uuid[16];
-    group_id_t group_id;
-    char name[MAX_NAME_SIZE];
-    uint16_t contents_len;
-    uint8_t iv[16];
-    uint8_t hmac[32];
-    uint8_t contents[MAX_CONTENTS_SIZE];
+    uint32_t in_use;           // Slot occupancy flag
+    uint8_t  slot;             // Slot index (for AAD reconstruction)
+    uint8_t  uuid[16];         // Unique file identifier
+    uint16_t group_id;         // Permission group
+    char     name[32];         // Null-terminated filename
+    uint16_t contents_len;     // Plaintext length (no padding needed)
+    uint8_t  nonce[12];        // GCM nonce
+    uint8_t  tag[16];          // GCM authentication tag
+    uint8_t  ciphertext[MAX_CONTENTS_SIZE];  // Encrypted contents
 } file_t;
 #pragma pack(pop)
 ```
 
-**FAT structure (functionally defined, at 0x3a000):**
+**Permission structure:**
 ```c
 typedef struct {
-    char uuid[UUID_SIZE];
-    uint16_t length;
-    uint16_t padding;
-    unsigned int flash_addr;
-} filesystem_entry_t;
+    uint16_t group_id;
+    uint8_t  read;    // 0 or 1
+    uint8_t  write;   // 0 or 1
+    uint8_t  receive; // 0 or 1
+} permission_t;
 ```
 
-**Write operation:**
-```
-1. Validate contents_len <= MAX_CONTENTS_SIZE
-2. Validate name: only printable ASCII (0x20-0x7E), null-terminated
-3. Generate 16-byte IV (TRNG)
-4. Encrypt: ciphertext = AES-256-CBC(AES_KEY, IV, PKCS7_pad(plaintext))
-5. Compute: hmac = HMAC(HMAC_KEY, slot || uuid || iv || group_id || name || len || ciphertext)
-6. Store to flash, update FAT with uuid
-```
-
-**Read operation:**
-```
-1. Verify slot < MAX_FILE_COUNT
-2. Verify slot in use
-3. Load file metadata (group_id) from flash
-4. Verify READ permission for file's group_id
-5. Load full file from flash
-6. Verify loaded file's group_id matches permission-checked group_id (TOCTOU defense)
-7. Verify stored slot matches requested slot
-8. Verify hmac = HMAC(HMAC_KEY, slot || uuid || iv || group_id || name || len || ciphertext)
-9. Decrypt and remove PKCS#7 padding
-10. Return plaintext (name + contents only)
-```
-
-**Integrity failure handling:** If HMAC verification fails on any file operation, treat slot as empty. 
 ---
 
 ## Interface Segregation
 
 | Interface | Allowed Messages |
 |-----------|------------------|
-| UART0 (Control) | LIST, READ, WRITE, RECEIVE, INTERROGATE (initiator), LISTEN |
+| UART0 (Management) | LIST, READ, WRITE, RECEIVE, INTERROGATE (initiator), LISTEN |
 | UART1 (Transfer) | RECEIVE, INTERROGATE (responder only) |
 
-Messages on wrong interface rejected immediately.
-
----
-
-## Local Operations (UART0)
-
-**LIST:** Requires valid PIN. Returns slot, group_id, name for each file.
-
-**READ:** Verify PIN → Verify READ permission for file's group_id → Load file → Re-verify group_id → Decrypt → Return name + plaintext contents.
-
-**WRITE:** Verify PIN → Verify WRITE permission for command's group_id → Validate name (printable ASCII) → Generate uuid (from host), encrypt, compute HMAC, store.
-
-**LISTEN:** No PIN required. Waits for INTERROGATE_MSG or RECEIVE_MSG on UART1, processes as sender/responder.
+Messages on wrong interface rejected immediately with generic error.
 
 ---
 
@@ -228,28 +290,35 @@ Messages on wrong interface rejected immediately.
 - perm_count <= MAX_PERMS (8); validate before iterating permissions array
 - name: printable ASCII only (0x20-0x7E), null-terminated, strnlen < MAX_NAME_SIZE
 - Boolean permission fields must be 0 or 1
+- Nonce must be exactly 12 bytes
 - Safe integer arithmetic: validate before computation
 - 2000ms timeout on all UART reads; 5000ms total protocol timeout
 
 ---
 
-## Side Channel Prevention
+## Side Channel Mitigations
 
-**PIN Verification with Glitch Resistance:**
+**PIN Verification (software, glitch-resistant):**
 ```c
 bool check_pin(uint8_t *input) {
     volatile uint8_t result1 = 0, result2 = 0;
     
-    for (int i = 0; i < PIN_LENGTH; i++) //XOR Accumulator for Constant-Time
+    // First pass: constant-time XOR accumulator
+    for (int i = 0; i < PIN_LENGTH; i++)
         result1 |= input[i] ^ stored_pin[i];
     
-    volatile uint8_t delay = TRNG_read_byte() & 0x7F;
-    while (delay--) { __asm("nop"); }
+    // Random delay to desynchronize glitch attempts
+    volatile uint8_t delay = trng_read_byte() & 0x7F;
+    for (volatile int j = 0; j < delay; j++) { __asm("nop"); }
     
+    // Second pass: detect single-glitch bypass
     for (int i = 0; i < PIN_LENGTH; i++)
         result2 |= input[i] ^ stored_pin[i];
     
-    if (result1 != result2) while(1);  // Glitch detected—Loss
+    // Glitch detection: results must match
+    if (result1 != result2) {
+        while(1);  // Halt on detected glitch
+    }
     
     if (result1 != 0) {
         busy_wait_5_seconds();
@@ -258,63 +327,60 @@ bool check_pin(uint8_t *input) {
     return true;
 }
 ```
-
-**Error Timing Consistency:**
-```c
-// Collect all verification results to prevent timing leaks
-bool ok = true;
-ok &= secure_compare(computed_mac, received_mac, 32);
-ok &= secure_compare(computed_auth, received_auth, 32);
-ok &= (file_group_id == expected_group_id);
-if (!ok) return GENERIC_ERROR;
-```
-
 ---
 
 ## Attack Mitigations
 
 | Attack | Mitigation |
 |--------|------------|
-| Brute force PIN | 5s delay per attempt |
-| Timing attacks | Constant-time comparisons; consistent error timing |
-| Flash dump keys | Hardware KEYSTORE (write-only) |
-| Forge permissions | Permission MAC verification; perm_count validation |
-| Rogue device injection | Mutual authentication (both parties prove AUTH_KEY) |
-| Slot swapping | requested_slot bound in transfer_mac |
-| File tampering | HMAC verification (includes slot, uuid, IV) |
-| TOCTOU | Re-verify group_id after load |
-| Replay transfer | Fresh challenge bound in transfer_mac |
-| Replay interrogate | Challenge bound in list_mac |
-| UART injection | Interface segregation |
-| Malformed packets | Exact length + bounds validation |
-| Permission array overflow | Validate perm_count <= MAX_PERMS before iteration |
-| Buffer overflow | Bounds checking, strncpy, validate before compute |
-| Voltage glitching | Double-check + random delays |
-| Memory disclosure | explicit_bzero() after use |
-| Group confusion | Inner/outer group_id must match; permission filtering |
-| Name injection | Printable ASCII validation |
-| Partial write corruption | HMAC failure = treat slot as empty |
+| Brute force PIN | 5s delay per failed attempt; constant-time comparison |
+| Timing attacks | Hardware GCM tag verify; secure_compare for HMAC; consistent error timing |
+| Key extraction (GCM) | Hardware KEYSTORE (write-only); GCM_KEY never in software |
+| Key extraction (AUTH) | AUTH_KEY in flash; minimize time in RAM during HMAC |
+| Permission forgery | PERMISSION_MAC verification; perm_count bounds check |
+| Rogue device injection | Mutual authentication via HMAC challenge-response |
+| Replay attacks | Fresh challenges bound into GCM AAD each transfer |
+| Slot swapping | requested_slot included in transfer AAD |
+| File tampering | GCM tag covers metadata (via AAD) + contents |
+| TOCTOU | Re-verify group_id after load, before return |
+| Nonce reuse | 12-byte TRNG nonce per operation |
+| Group ID manipulation | group_id in AAD; tag fails if modified |
+| Glitch attacks | Double-check with random delay; halt on mismatch |
+| Buffer overflow | Strict length validation; safe memcpy wrappers |
 
 ---
 
-## Error Handling
+## AAD Structure Reference
 
-- Return generic error code (no details that aid attackers)
-- Never reveal which check failed
-- All error paths execute in consistent time
-- Disable debug output in production
-- 2000ms read timeout; 5000ms protocol timeout prevents hangs
+**File Storage AAD (51 bytes):**
+```
+Offset  Size  Field
+0       1     slot
+1       16    uuid
+17      2     group_id (little-endian)
+19      32    name (null-padded)
+```
+
+**Transfer AAD (43 bytes):**
+```
+Offset  Size  Field
+0       12    receiver_challenge
+12      12    sender_challenge
+24      1     requested_slot
+25      16    uuid
+41      2     group_id (little-endian)
+```
 
 ---
 
-## Build-Time Security
+## HMAC Domain Separation
 
-**gen_secrets.py:** Generate keys using `secrets.token_bytes(32)`.
+All HMAC operations include a domain separator string to prevent cross-protocol attacks:
 
-**secrets_to_c_header.py:**
-- Compute PERMISSION_MAC = HMAC(AUTH_KEY, perm_count || serialized_permissions)
-- Serialize: little-endian, packed, canonical order
-
-**Deployment isolation:** Each deployment has unique keys. Cross-deployment authentication impossible without key extraction.
-
----
+| Context | HMAC Input |
+|---------|------------|
+| Sender auth | `receiver_challenge \|\| "sender"` |
+| Receiver auth | `sender_challenge \|\| "receiver"` |
+| Interrogate request | `challenge \|\| "interrogate_req"` |
+| Interrogate response | `challenge \|\| file_list \|\| "interrogate_resp"` |
+| Permission MAC | `perm_count \|\| serialized_permissions` (no separator, build-time) |

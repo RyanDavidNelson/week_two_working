@@ -1,3 +1,80 @@
+# ============================================================================
+# Makefile Additions for Crypto Module (Week 2)
+# ============================================================================
+# Add these changes to firmware/Makefile
+# ============================================================================
+
+# --------------------------------------------------------------------------
+# 1. ADD crypto.so TO OBJECTS LIST
+# --------------------------------------------------------------------------
+# Find the OBJECTS = ... line and add:
+#     $(BUILDDIR)/crypto.so \
+
+# Example:
+# OBJECTS = $(BUILDDIR)/HSM.so \
+#     $(BUILDDIR)/simple_uart.so \
+#     $(BUILDDIR)/ti_msp_dl_config.so \
+#     $(BUILDDIR)/startup_mspm0l222x_ticlang.so \
+#     $(BUILDDIR)/simple_flash.so \
+#     $(BUILDDIR)/host_messaging.so \
+#     $(BUILDDIR)/security.so \
+#     $(BUILDDIR)/filesystem.so \
+#     $(BUILDDIR)/commands.so \
+#     $(BUILDDIR)/crypto.so
+
+# --------------------------------------------------------------------------
+# 2. REMOVE CRYPTO_EXAMPLE FLAG, ADD PROPER WOLFSSL FLAGS
+# --------------------------------------------------------------------------
+# Replace:
+#     CRYPTO_EXAMPLE = 0
+# With proper wolfssl configuration:
+
+# WolfSSL Configuration for HMAC-SHA256
+CFLAGS += -DNO_WOLFSSL_DIR
+CFLAGS += -DSINGLE_THREADED
+CFLAGS += -DHAVE_PK_CALLBACKS
+CFLAGS += -DWOLFSSL_USER_IO
+CFLAGS += -DNO_WRITEV
+CFLAGS += -DTIME_T_NOT_64BIT
+CFLAGS += -DNO_FILESYSTEM
+CFLAGS += -DNO_DEV_RANDOM
+CFLAGS += -DWC_NO_DEFAULT_DEVID
+CFLAGS += -DWOLF_CRYPTO_CB
+
+# Enable SHA-256 and HMAC (disable unused algorithms)
+CFLAGS += -DNO_MD5
+CFLAGS += -DNO_SHA
+CFLAGS += -DNO_AES          # We use hardware AESADV, not wolfssl AES
+CFLAGS += -DNO_DES3
+CFLAGS += -DNO_RSA
+CFLAGS += -DNO_DSA
+CFLAGS += -DNO_DH
+CFLAGS += -DNO_RC4
+CFLAGS += -DNO_RABBIT
+CFLAGS += -DNO_HC128
+CFLAGS += -DNO_PSK
+CFLAGS += -DNO_PWDBASED
+
+# Include wolfssl headers
+CFLAGS += -I./wolfssl
+
+# --------------------------------------------------------------------------
+# 3. ADD WOLFSSL OBJECTS FOR HMAC-SHA256
+# --------------------------------------------------------------------------
+WOLFSSL_INC = wolfssl/wolfcrypt/src
+
+OBJECTS += $(WOLFSSL_INC)/sha256.o
+OBJECTS += $(WOLFSSL_INC)/hmac.o
+OBJECTS += $(WOLFSSL_INC)/hash.o
+OBJECTS += $(WOLFSSL_INC)/cryptocb.o
+
+# --------------------------------------------------------------------------
+# 4. COMPLETE EXAMPLE MAKEFILE
+# --------------------------------------------------------------------------
+# Here's what the updated Makefile should look like:
+
+# --- BEGIN UPDATED MAKEFILE ---
+
 MSPM0_SDK_INSTALL_DIR ?= $(abspath ../../../../../..)
 
 include $(MSPM0_SDK_INSTALL_DIR)/tools/imports_mak/imports.mak.linux
@@ -9,10 +86,7 @@ BUILDDIR ?= /tmp/build
 VPATH = "src"
 LINKERFILE = "firmware.ld"
 
-# to download wolfssl for the simple crypto example, `cd ./firmware/ && git clone https://github.com/wolfSSL/wolfssl`
-# then set this variable to 1
-CRYPTO_EXAMPLE = 0
-
+# Main firmware objects
 OBJECTS = $(BUILDDIR)/HSM.so \
     $(BUILDDIR)/simple_uart.so \
     $(BUILDDIR)/ti_msp_dl_config.so \
@@ -21,43 +95,49 @@ OBJECTS = $(BUILDDIR)/HSM.so \
     $(BUILDDIR)/host_messaging.so \
     $(BUILDDIR)/security.so \
     $(BUILDDIR)/filesystem.so \
-    $(BUILDDIR)/commands.so 
+    $(BUILDDIR)/commands.so \
+    $(BUILDDIR)/crypto.so
 
-ifeq ($(CRYPTO_EXAMPLE), 1)
-OBJECTS += $(BUILDDIR)/simple_crypto.so
-
-# change C flags
-CFLAGS += -DCRYPTO_EXAMPLE=1
+# WolfSSL Configuration for HMAC-SHA256
 CFLAGS += -DNO_WOLFSSL_DIR
-CFLAGS += -DWOLFSSL_AES_DIRECT
 CFLAGS += -DSINGLE_THREADED
-# From https://www.wolfssl.com/documentation/manuals/wolfssl/chapter02.html#building-with-gcc-arm
 CFLAGS += -DHAVE_PK_CALLBACKS
 CFLAGS += -DWOLFSSL_USER_IO
-CFLAGS += -DNO_WRITEV -DTIME_T_NOT_64BIT
+CFLAGS += -DNO_WRITEV
+CFLAGS += -DTIME_T_NOT_64BIT
 CFLAGS += -DNO_FILESYSTEM
-# tells wolfssl that we will handle RNG on the baremetal target
-# user will need to implement the callbacks
 CFLAGS += -DNO_DEV_RANDOM
 CFLAGS += -DWC_NO_DEFAULT_DEVID
 CFLAGS += -DWOLF_CRYPTO_CB
-
-WOLFSSL_INC = wolfssl/wolfcrypt/src
+CFLAGS += -DNO_MD5
+CFLAGS += -DNO_SHA
+CFLAGS += -DNO_AES
+CFLAGS += -DNO_DES3
+CFLAGS += -DNO_RSA
+CFLAGS += -DNO_DSA
+CFLAGS += -DNO_DH
+CFLAGS += -DNO_RC4
+CFLAGS += -DNO_RABBIT
+CFLAGS += -DNO_HC128
+CFLAGS += -DNO_PSK
+CFLAGS += -DNO_PWDBASED
 CFLAGS += -I./wolfssl
 
-# we need to build these objects for the simple crypto example
-OBJECTS += $(WOLFSSL_INC)/aes.o $(WOLFSSL_INC)/hash.o
-OBJECTS += $(WOLFSSL_INC)/md5.o $(WOLFSSL_INC)/cryptocb.o
-endif
+# WolfSSL objects for HMAC-SHA256
+WOLFSSL_INC = wolfssl/wolfcrypt/src
+OBJECTS += $(WOLFSSL_INC)/sha256.o
+OBJECTS += $(WOLFSSL_INC)/hmac.o
+OBJECTS += $(WOLFSSL_INC)/hash.o
+OBJECTS += $(WOLFSSL_INC)/cryptocb.o
 
 NAME = hsm
 
 CFLAGS += -I.. \
     -D__MSPM0L2228__ \
-    -O0 \
+    -O2 \
     "-I$(MSPM0_SDK_INSTALL_DIR)/source/third_party/CMSIS/Core/Include" \
     "-I$(MSPM0_SDK_INSTALL_DIR)/source" \
-	"-I./inc" \
+    "-I./inc" \
     -gdwarf-3 \
     -mcpu=cortex-m0plus \
     -march=thumbv6m \
@@ -85,22 +165,16 @@ $(BUILDDIR)/%.so: ./src/%.c | $(BUILDDIR)
 	@ echo Building $@
 	@ $(CC) $(CFLAGS) -c $< -o $@
 
-# if compiling with the crypto example, compile all crypto objects
-ifeq ($(CRYPTO_EXAMPLE), 1)
-$(WOLFSSL_INC)/%.o: $(WOLFSSL_INC)/%.c
-	@ echo Building $@
-	@ $(CC) $(CFLAGS) -c $< -o $@
-endif
-
 $(BUILDDIR)/$(NAME).elf: $(OBJECTS)
-	@ echo linking $@
-	@ $(LNK) -Wl,-u,_c_int00 $(OBJECTS)  $(LFLAGS) -o $(BUILDDIR)/$(NAME).elf
+	@ echo Linking $@
+	@ $(LNK) -Wl,-O3 $(OBJECTS) $(LFLAGS) -o $@
 
 $(BUILDDIR)/$(NAME).bin: $(BUILDDIR)/$(NAME).elf
-	@ $(OBJCOPY) -O binary $(BUILDDIR)/$(NAME).elf $(BUILDDIR)/$(NAME).bin
+	@ $(OBJCOPY) -O binary $< $@
 
 clean:
-	@ echo Cleaning...
-	@ $(RM) $(OBJECTS) > $(DEVNULL) 2>&1
-	@ $(RM) $(NAME).elf > $(DEVNULL) 2>&1
-	@ $(RM) $(NAME).map > $(DEVNULL) 2>&1
+	@ rm -rf $(BUILDDIR)
+
+.PHONY: all clean
+
+# --- END UPDATED MAKEFILE ---

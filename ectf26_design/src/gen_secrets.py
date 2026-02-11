@@ -1,5 +1,11 @@
 """
-Author: Ben Janis
+gen_secrets.py - Generate deployment secrets for eCTF HSM
+
+Generates:
+- GCM_KEY (256-bit): AES-256-GCM encryption + integrity key
+- AUTH_KEY (256-bit): HMAC-SHA256 authentication key
+
+Author: UTD eCTF Team
 Date: 2026
 
 This source file is part of an example system for MITRE's 2026 Embedded CTF
@@ -12,6 +18,7 @@ Copyright: Copyright (c) 2026 The MITRE Corporation
 
 import argparse
 import json
+import secrets as crypto_secrets
 from pathlib import Path
 
 from loguru import logger
@@ -32,27 +39,23 @@ def gen_secrets(groups: list[int]) -> bytes:
 
     :returns: Contents of the secrets file
     """
-    # TODO: Update this function to generate any system-wide secrets needed by
-    #   your design
+    # Generate cryptographic keys
+    gcm_key = crypto_secrets.token_bytes(32)   # AES-256-GCM key
+    auth_key = crypto_secrets.token_bytes(32)  # HMAC-SHA256 key
 
     # Create the secrets object
-    # You can change this to generate any secret material
-    # The secrets file will never be shared with attackers
-    secrets = {
+    secrets_dict = {
         "groups": groups,
-        "some_secrets": "EXAMPLE",
+        "gcm_key": gcm_key.hex(),
+        "auth_key": auth_key.hex(),
     }
 
-    # NOTE: if you choose to use JSON for your file type, you will not
-    # be able to store binary data, and must either use a different file
-    # type or encode the binary data to hex, base64, or another type of
-    # ASCII-only encoding
-    return json.dumps(secrets).encode()
+    # Return as JSON bytes
+    return json.dumps(secrets_dict).encode()
 
 
 def parse_args():
-    """Define and parse the command line arguments
-    """
+    """Define and parse the command line arguments"""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--force",
