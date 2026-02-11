@@ -24,39 +24,37 @@
 #include <wolfssl/wolfcrypt/hmac.h>
 #include <string.h>
 
-/*
- * Storage AAD size: slot(1) + uuid(16) + group_id(2) + name(32) = 51
- */
-#define STORAGE_AAD_SIZE    51
+/* Alignment macro for DMA/hardware buffers */
+#define ALIGNED_BUFFER __attribute__((aligned(4)))
 
 /*
- * Transfer AAD size: recv_chal(12) + send_chal(12) + slot(1) + uuid(16) + group_id(2) = 43
+ * KEYSTORE configuration for writing 256-bit key
  */
-#define TRANSFER_AAD_SIZE   43
+static DL_KEYSTORECTL_KeyWrConfig gKeyWriteConfig = {
+    .keySlot = DL_KEYSTORECTL_KEY_SLOT_0,
+    .keySize = DL_KEYSTORECTL_KEY_SIZE_256_BITS,
+    .key = NULL  /* Set at runtime */
+};
+
+/*
+ * KEYSTORE configuration for transferring key to AES engine
+ */
+static DL_KEYSTORECTL_Config gKeyTransferConfig = {
+    .keySlot = DL_KEYSTORECTL_KEY_SLOT_0,
+    .keySize = DL_KEYSTORECTL_KEY_SIZE_256_BITS,
+    .cryptoSel = DL_KEYSTORECTL_CRYPTO_SEL_AES
+};
 
 /*
  * Crypto Initialization - Load GCM key into KEYSTORE
  */
 int crypto_init(void)
 {
-    DL_KEYSTORECTL_KeyWrConfig keyConfig;
-    
-    /* Enable KEYSTORECTL */
-    DL_KEYSTORECTL_enablePower(KEYSTORECTL);
-    delay_cycles(1000);
+    /* Set key pointer */
+    gKeyWriteConfig.key = (uint32_t *)GCM_KEY;
     
     /* Write GCM_KEY to KEYSTORE slot 0 */
-    keyConfig.keySlot = KEYSTORE_SLOT_GCM;
-    keyConfig.keySize = DL_KEYSTORECTL_KEY_SIZE_256_BITS;
-    DL_KEYSTORECTL_setKeyWrConfig(KEYSTORECTL, &keyConfig);
-    DL_KEYSTORECTL_writeKeyAligned(KEYSTORECTL, (const uint32_t *)GCM_KEY);
-    while (DL_KEYSTORECTL_getKeyStatusReg(KEYSTORECTL) != DL_KEYSTORECTL_STATUS_VALID) {
-        /* Wait for key write */
-    }
-    
-    /* Enable AESADV */
-    DL_AESADV_enablePower(AESADV);
-    delay_cycles(1000);
+    DL_KEYSTORECTL_writeKey(KEYSTORECTL, &gKeyWriteConfig);
     
     return CRYPTO_OK;
 }
@@ -66,14 +64,11 @@ int crypto_init(void)
  */
 static void transfer_key_to_aes(void)
 {
-    DL_KEYSTORECTL_transferKey(KEYSTORECTL, KEYSTORE_SLOT_GCM, DL_KEYSTORECTL_KEY_DEST_AESADV);
-    while (DL_KEYSTORECTL_getKeyStatusReg(KEYSTORECTL) != DL_KEYSTORECTL_STATUS_VALID) {
-        /* Wait for key transfer */
-    }
+    DL_KEYSTORECTL_transferKey(KEYSTORECTL, &gKeyTransferConfig);
 }
 
 /*
- * Internal: Single AES-GCM encrypt pass (no protection)
+ * Internal: Single AES-GCM encrypt pass (no glitch protection)
  */
 static int aes_gcm_encrypt_single(const uint8_t *nonce,
                                   const uint8_t *aad, size_t aad_len,
@@ -82,45 +77,54 @@ static int aes_gcm_encrypt_single(const uint8_t *nonce,
                                   uint8_t *tag)
 {
     size_t i;
-    ALIGNED_BUFFER uint8_t iv_block[16];
+    size_t full_blocks;
+    size_t remaining;
+    ALIGNED_BUFFER uint8_t iv_buf[16];
+    ALIGNED_BUFFER uint8_t padded[AES_BLOCK_SIZE];
+    ALIGNED_BUFFER uint8_t out_padded[AES_BLOCK_SIZE];
     
-    /* Reset and configure AESADV */
-    DL_AESADV_reset(AESADV);
+    /* Build IV: 12-byte nonce + 4-byte counter (starts at 1 for GCM) */
+    memset(iv_buf, 0, 16);
+    memcpy(iv_buf, nonce, NONCE_SIZE);
+    iv_buf[15] = 0x01;  /* GCM counter starts at 1 */
+    
+    /* Configure GCM operation */
+    DL_AESADV_Config gcmConfig = {
+        .mode = DL_AESADV_MODE_GCM_AUTONOMOUS,
+        .direction = DL_AESADV_DIR_ENCRYPT,
+        .ctr_ctrWidth = DL_AESADV_CTR_WIDTH_32_BIT,
+        .cfb_fbWidth = DL_AESADV_FB_WIDTH_128,
+        .ccm_ctrWidth = DL_AESADV_CCM_CTR_WIDTH_2_BYTES,
+        .ccm_tagWidth = DL_AESADV_CCM_TAG_WIDTH_1_BYTE,
+        .iv = iv_buf,
+        .nonce = NULL,
+        .lowerCryptoLength = (uint32_t)pt_len,
+        .upperCryptoLength = 0,
+        .aadLength = (uint32_t)aad_len
+    };
+    
+    /* Set key size and transfer from KEYSTORE */
     DL_AESADV_setKeySize(AESADV, DL_AESADV_KEY_SIZE_256_BIT);
-    
-    /* Transfer key from KEYSTORE */
     transfer_key_to_aes();
     
-    /* Build IV block: nonce (12 bytes) || counter (4 bytes, starts at 1 for CTR) */
-    memset(iv_block, 0, 16);
-    memcpy(iv_block, nonce, NONCE_SIZE);
-    /* GCM initial counter is 1 (handled by hardware) */
+    /* Initialize GCM mode */
+    DL_AESADV_initGCM(AESADV, &gcmConfig);
     
-    /* Load IV/nonce */
-    DL_AESADV_initGCM(AESADV, iv_block);
-    
-    /* Configure for GCM encryption */
-    DL_AESADV_setMode(AESADV, DL_AESADV_MODE_GCM_AUTONOMOUS);
-    DL_AESADV_setDirection(AESADV, DL_AESADV_DIR_ENCRYPT);
-    
-    /* Set lengths */
-    DL_AESADV_setLowerCryptoLength(AESADV, (uint32_t)pt_len);
-    DL_AESADV_setUpperCryptoLength(AESADV, 0);
-    DL_AESADV_setAADLength(AESADV, (uint32_t)aad_len);
-    
-    /* Process AAD (authenticated but not encrypted) */
+    /* Process AAD if present */
     if (aad_len > 0) {
-        /* Process full blocks */
-        size_t full_blocks = aad_len / AES_BLOCK_SIZE;
+        full_blocks = aad_len / AES_BLOCK_SIZE;
+        
+        /* Full AAD blocks */
         for (i = 0; i < full_blocks; i++) {
             while (!DL_AESADV_isInputReady(AESADV)) { }
-            DL_AESADV_loadInputDataAligned(AESADV, (const uint32_t *)(aad + i * AES_BLOCK_SIZE));
+            DL_AESADV_loadInputDataAligned(AESADV, 
+                (const uint32_t *)(aad + i * AES_BLOCK_SIZE));
         }
         
-        /* Handle partial last block */
-        size_t remaining = aad_len % AES_BLOCK_SIZE;
+        /* Partial AAD block (zero-padded) */
+        remaining = aad_len % AES_BLOCK_SIZE;
         if (remaining > 0) {
-            ALIGNED_BUFFER uint8_t padded[AES_BLOCK_SIZE] = {0};
+            memset(padded, 0, AES_BLOCK_SIZE);
             memcpy(padded, aad + full_blocks * AES_BLOCK_SIZE, remaining);
             while (!DL_AESADV_isInputReady(AESADV)) { }
             DL_AESADV_loadInputDataAligned(AESADV, (const uint32_t *)padded);
@@ -129,37 +133,40 @@ static int aes_gcm_encrypt_single(const uint8_t *nonce,
     
     /* Process plaintext → ciphertext */
     if (pt_len > 0) {
-        size_t full_blocks = pt_len / AES_BLOCK_SIZE;
+        full_blocks = pt_len / AES_BLOCK_SIZE;
+        
+        /* Full plaintext blocks */
         for (i = 0; i < full_blocks; i++) {
             while (!DL_AESADV_isInputReady(AESADV)) { }
-            DL_AESADV_loadInputDataAligned(AESADV, (const uint32_t *)(plaintext + i * AES_BLOCK_SIZE));
+            DL_AESADV_loadInputDataAligned(AESADV, 
+                (const uint32_t *)(plaintext + i * AES_BLOCK_SIZE));
             while (!DL_AESADV_isOutputReady(AESADV)) { }
-            DL_AESADV_readOutputDataAligned(AESADV, (uint32_t *)(ciphertext + i * AES_BLOCK_SIZE));
+            DL_AESADV_readOutputDataAligned(AESADV, 
+                (uint32_t *)(ciphertext + i * AES_BLOCK_SIZE));
         }
         
-        /* Handle partial last block */
-        size_t remaining = pt_len % AES_BLOCK_SIZE;
+        /* Partial plaintext block */
+        remaining = pt_len % AES_BLOCK_SIZE;
         if (remaining > 0) {
-            ALIGNED_BUFFER uint8_t in_padded[AES_BLOCK_SIZE] = {0};
-            ALIGNED_BUFFER uint8_t out_padded[AES_BLOCK_SIZE];
-            memcpy(in_padded, plaintext + full_blocks * AES_BLOCK_SIZE, remaining);
+            memset(padded, 0, AES_BLOCK_SIZE);
+            memcpy(padded, plaintext + full_blocks * AES_BLOCK_SIZE, remaining);
             while (!DL_AESADV_isInputReady(AESADV)) { }
-            DL_AESADV_loadInputDataAligned(AESADV, (const uint32_t *)in_padded);
+            DL_AESADV_loadInputDataAligned(AESADV, (const uint32_t *)padded);
             while (!DL_AESADV_isOutputReady(AESADV)) { }
             DL_AESADV_readOutputDataAligned(AESADV, (uint32_t *)out_padded);
             memcpy(ciphertext + full_blocks * AES_BLOCK_SIZE, out_padded, remaining);
         }
     }
     
-    /* Read authentication tag */
-    while (!DL_AESADV_isOutputReady(AESADV)) { }
-    DL_AESADV_readTag(AESADV, (uint32_t *)tag);
+    /* Wait for tag to be ready and read it */
+    while (!DL_AESADV_isSavedOutputContextReady(AESADV)) { }
+    DL_AESADV_readTAGAligned(AESADV, (uint32_t *)tag);
     
     return CRYPTO_OK;
 }
 
 /*
- * Internal: Single AES-GCM decrypt pass (no protection)
+ * Internal: Single AES-GCM decrypt pass (no glitch protection)
  * Returns CRYPTO_OK if tag matches, CRYPTO_ERR_TAG otherwise
  */
 static int aes_gcm_decrypt_single(const uint8_t *nonce,
@@ -169,43 +176,53 @@ static int aes_gcm_decrypt_single(const uint8_t *nonce,
                                   uint8_t *plaintext)
 {
     size_t i;
-    ALIGNED_BUFFER uint8_t iv_block[16];
+    size_t full_blocks;
+    size_t remaining;
+    ALIGNED_BUFFER uint8_t iv_buf[16];
+    ALIGNED_BUFFER uint8_t padded[AES_BLOCK_SIZE];
+    ALIGNED_BUFFER uint8_t out_padded[AES_BLOCK_SIZE];
     ALIGNED_BUFFER uint8_t computed_tag[TAG_SIZE];
     
-    /* Reset and configure AESADV */
-    DL_AESADV_reset(AESADV);
-    DL_AESADV_setKeySize(AESADV, DL_AESADV_KEY_SIZE_256_BIT);
+    /* Build IV: 12-byte nonce + 4-byte counter */
+    memset(iv_buf, 0, 16);
+    memcpy(iv_buf, nonce, NONCE_SIZE);
+    iv_buf[15] = 0x01;
     
-    /* Transfer key from KEYSTORE */
+    /* Configure GCM decryption */
+    DL_AESADV_Config gcmConfig = {
+        .mode = DL_AESADV_MODE_GCM_AUTONOMOUS,
+        .direction = DL_AESADV_DIR_DECRYPT,
+        .ctr_ctrWidth = DL_AESADV_CTR_WIDTH_32_BIT,
+        .cfb_fbWidth = DL_AESADV_FB_WIDTH_128,
+        .ccm_ctrWidth = DL_AESADV_CCM_CTR_WIDTH_2_BYTES,
+        .ccm_tagWidth = DL_AESADV_CCM_TAG_WIDTH_1_BYTE,
+        .iv = iv_buf,
+        .nonce = NULL,
+        .lowerCryptoLength = (uint32_t)ct_len,
+        .upperCryptoLength = 0,
+        .aadLength = (uint32_t)aad_len
+    };
+    
+    /* Set key size and transfer from KEYSTORE */
+    DL_AESADV_setKeySize(AESADV, DL_AESADV_KEY_SIZE_256_BIT);
     transfer_key_to_aes();
     
-    /* Build IV block */
-    memset(iv_block, 0, 16);
-    memcpy(iv_block, nonce, NONCE_SIZE);
+    /* Initialize GCM mode */
+    DL_AESADV_initGCM(AESADV, &gcmConfig);
     
-    /* Load IV/nonce */
-    DL_AESADV_initGCM(AESADV, iv_block);
-    
-    /* Configure for GCM decryption */
-    DL_AESADV_setMode(AESADV, DL_AESADV_MODE_GCM_AUTONOMOUS);
-    DL_AESADV_setDirection(AESADV, DL_AESADV_DIR_DECRYPT);
-    
-    /* Set lengths */
-    DL_AESADV_setLowerCryptoLength(AESADV, (uint32_t)ct_len);
-    DL_AESADV_setUpperCryptoLength(AESADV, 0);
-    DL_AESADV_setAADLength(AESADV, (uint32_t)aad_len);
-    
-    /* Process AAD */
+    /* Process AAD if present */
     if (aad_len > 0) {
-        size_t full_blocks = aad_len / AES_BLOCK_SIZE;
+        full_blocks = aad_len / AES_BLOCK_SIZE;
+        
         for (i = 0; i < full_blocks; i++) {
             while (!DL_AESADV_isInputReady(AESADV)) { }
-            DL_AESADV_loadInputDataAligned(AESADV, (const uint32_t *)(aad + i * AES_BLOCK_SIZE));
+            DL_AESADV_loadInputDataAligned(AESADV, 
+                (const uint32_t *)(aad + i * AES_BLOCK_SIZE));
         }
         
-        size_t remaining = aad_len % AES_BLOCK_SIZE;
+        remaining = aad_len % AES_BLOCK_SIZE;
         if (remaining > 0) {
-            ALIGNED_BUFFER uint8_t padded[AES_BLOCK_SIZE] = {0};
+            memset(padded, 0, AES_BLOCK_SIZE);
             memcpy(padded, aad + full_blocks * AES_BLOCK_SIZE, remaining);
             while (!DL_AESADV_isInputReady(AESADV)) { }
             DL_AESADV_loadInputDataAligned(AESADV, (const uint32_t *)padded);
@@ -214,21 +231,23 @@ static int aes_gcm_decrypt_single(const uint8_t *nonce,
     
     /* Process ciphertext → plaintext */
     if (ct_len > 0) {
-        size_t full_blocks = ct_len / AES_BLOCK_SIZE;
+        full_blocks = ct_len / AES_BLOCK_SIZE;
+        
         for (i = 0; i < full_blocks; i++) {
             while (!DL_AESADV_isInputReady(AESADV)) { }
-            DL_AESADV_loadInputDataAligned(AESADV, (const uint32_t *)(ciphertext + i * AES_BLOCK_SIZE));
+            DL_AESADV_loadInputDataAligned(AESADV, 
+                (const uint32_t *)(ciphertext + i * AES_BLOCK_SIZE));
             while (!DL_AESADV_isOutputReady(AESADV)) { }
-            DL_AESADV_readOutputDataAligned(AESADV, (uint32_t *)(plaintext + i * AES_BLOCK_SIZE));
+            DL_AESADV_readOutputDataAligned(AESADV, 
+                (uint32_t *)(plaintext + i * AES_BLOCK_SIZE));
         }
         
-        size_t remaining = ct_len % AES_BLOCK_SIZE;
+        remaining = ct_len % AES_BLOCK_SIZE;
         if (remaining > 0) {
-            ALIGNED_BUFFER uint8_t in_padded[AES_BLOCK_SIZE] = {0};
-            ALIGNED_BUFFER uint8_t out_padded[AES_BLOCK_SIZE];
-            memcpy(in_padded, ciphertext + full_blocks * AES_BLOCK_SIZE, remaining);
+            memset(padded, 0, AES_BLOCK_SIZE);
+            memcpy(padded, ciphertext + full_blocks * AES_BLOCK_SIZE, remaining);
             while (!DL_AESADV_isInputReady(AESADV)) { }
-            DL_AESADV_loadInputDataAligned(AESADV, (const uint32_t *)in_padded);
+            DL_AESADV_loadInputDataAligned(AESADV, (const uint32_t *)padded);
             while (!DL_AESADV_isOutputReady(AESADV)) { }
             DL_AESADV_readOutputDataAligned(AESADV, (uint32_t *)out_padded);
             memcpy(plaintext + full_blocks * AES_BLOCK_SIZE, out_padded, remaining);
@@ -236,8 +255,8 @@ static int aes_gcm_decrypt_single(const uint8_t *nonce,
     }
     
     /* Read computed tag */
-    while (!DL_AESADV_isOutputReady(AESADV)) { }
-    DL_AESADV_readTag(AESADV, (uint32_t *)computed_tag);
+    while (!DL_AESADV_isSavedOutputContextReady(AESADV)) { }
+    DL_AESADV_readTAGAligned(AESADV, (uint32_t *)computed_tag);
     
     /* Constant-time tag comparison */
     if (!secure_compare(computed_tag, expected_tag, TAG_SIZE)) {
@@ -281,7 +300,8 @@ int aes_gcm_encrypt(const uint8_t *nonce,
     random_delay();
     
     /* First encryption pass */
-    result1 = aes_gcm_encrypt_single(nonce, aad, aad_len, plaintext, pt_len, ciphertext, tag);
+    result1 = aes_gcm_encrypt_single(nonce, aad, aad_len, plaintext, pt_len, 
+                                      ciphertext, tag);
     if (result1 != CRYPTO_OK) {
         return result1;
     }
@@ -290,7 +310,8 @@ int aes_gcm_encrypt(const uint8_t *nonce,
     random_delay();
     
     /* Second encryption pass to separate buffers */
-    result2 = aes_gcm_encrypt_single(nonce, aad, aad_len, plaintext, pt_len, ciphertext2, tag2);
+    result2 = aes_gcm_encrypt_single(nonce, aad, aad_len, plaintext, pt_len, 
+                                      ciphertext2, tag2);
     
     /* Constant-time comparisons */
     ct_match = (pt_len == 0) || secure_compare(ciphertext, ciphertext2, pt_len);
@@ -308,6 +329,7 @@ int aes_gcm_encrypt(const uint8_t *nonce,
         secure_zero(ciphertext, pt_len);
         secure_zero(tag, TAG_SIZE);
         security_halt();
+        /* Never returns */
     }
     
     return CRYPTO_OK;
@@ -344,13 +366,15 @@ int aes_gcm_decrypt(const uint8_t *nonce,
     random_delay();
     
     /* First decryption pass */
-    result1 = aes_gcm_decrypt_single(nonce, aad, aad_len, ciphertext, ct_len, tag, plaintext);
+    result1 = aes_gcm_decrypt_single(nonce, aad, aad_len, ciphertext, ct_len, 
+                                      tag, plaintext);
     
     /* Random delay between computations */
     random_delay();
     
     /* Second decryption pass to separate buffer */
-    result2 = aes_gcm_decrypt_single(nonce, aad, aad_len, ciphertext, ct_len, tag, plaintext2);
+    result2 = aes_gcm_decrypt_single(nonce, aad, aad_len, ciphertext, ct_len, 
+                                      tag, plaintext2);
     
     /* Constant-time comparison (only if first succeeded) */
     pt_match = (ct_len == 0) || secure_compare(plaintext, plaintext2, ct_len);
@@ -371,6 +395,7 @@ int aes_gcm_decrypt(const uint8_t *nonce,
     if (result1 != result2 || !pt_match) {
         secure_zero(plaintext, ct_len);
         security_halt();
+        /* Never returns */
     }
     
     return CRYPTO_OK;
@@ -512,7 +537,7 @@ bool hmac_verify_domain(const uint8_t *key,
 }
 
 /*
- * Nonce Generation - 12 bytes from TRNG
+ * Generate random nonce using hardware TRNG
  */
 int generate_nonce(uint8_t *nonce)
 {
@@ -522,7 +547,7 @@ int generate_nonce(uint8_t *nonce)
         return CRYPTO_ERR_PARAM;
     }
     
-    /* Fill nonce from hardware TRNG */
+    /* Read 12 random bytes from TRNG */
     for (i = 0; i < NONCE_SIZE; i++) {
         nonce[i] = trng_read_byte();
     }
@@ -531,8 +556,8 @@ int generate_nonce(uint8_t *nonce)
 }
 
 /*
- * Build Storage AAD
- * Format: slot(1) || uuid(16) || group_id(2, LE) || name(32, null-padded)
+ * Build AAD for file storage
+ * Format: slot(1) || uuid(16) || group_id(2) || name(32) = 51 bytes
  */
 size_t build_storage_aad(uint8_t slot,
                          const uint8_t *uuid,
@@ -557,17 +582,19 @@ size_t build_storage_aad(uint8_t slot,
     memset(aad + offset, 0, 32);
     if (name != NULL) {
         size_t name_len = strlen(name);
-        if (name_len > 31) name_len = 31;
+        if (name_len > 31) {
+            name_len = 31;
+        }
         memcpy(aad + offset, name, name_len);
     }
     offset += 32;
     
-    return offset;  /* Should be 51 */
+    return offset;  /* 51 */
 }
 
 /*
- * Build Transfer AAD
- * Format: recv_chal(12) || send_chal(12) || slot(1) || uuid(16) || group_id(2, LE)
+ * Build AAD for file transfer
+ * Format: recv_chal(12) || send_chal(12) || slot(1) || uuid(16) || group_id(2) = 43 bytes
  */
 size_t build_transfer_aad(const uint8_t *receiver_challenge,
                           const uint8_t *sender_challenge,
@@ -579,12 +606,12 @@ size_t build_transfer_aad(const uint8_t *receiver_challenge,
     size_t offset = 0;
     
     /* Receiver challenge (12 bytes) */
-    memcpy(aad + offset, receiver_challenge, NONCE_SIZE);
-    offset += NONCE_SIZE;
+    memcpy(aad + offset, receiver_challenge, 12);
+    offset += 12;
     
     /* Sender challenge (12 bytes) */
-    memcpy(aad + offset, sender_challenge, NONCE_SIZE);
-    offset += NONCE_SIZE;
+    memcpy(aad + offset, sender_challenge, 12);
+    offset += 12;
     
     /* Slot (1 byte) */
     aad[offset++] = slot;
@@ -597,5 +624,5 @@ size_t build_transfer_aad(const uint8_t *receiver_challenge,
     aad[offset++] = (uint8_t)(group_id & 0xFF);
     aad[offset++] = (uint8_t)((group_id >> 8) & 0xFF);
     
-    return offset;  /* Should be 43 */
+    return offset;  /* 43 */
 }

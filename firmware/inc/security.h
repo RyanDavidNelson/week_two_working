@@ -47,7 +47,7 @@ void random_delay(void);
  */
 
 void secure_zero(void *ptr, size_t len);
-void halt(void);
+void security_halt(void) __attribute__((noreturn));
 
 /*
  * Hardware TRNG Functions

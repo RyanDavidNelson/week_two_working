@@ -65,12 +65,11 @@ void secure_zero(void *ptr, size_t len)
     }
 }
 
-void halt(void)
-{
-    while (1) {
-        __asm volatile("nop");
-    }
-}
+void security_halt(void)
+   {
+       __disable_irq();
+       while (1) { __asm volatile("nop"); }
+   }
 
 /*
  * Hardware TRNG Functions
