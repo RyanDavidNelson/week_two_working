@@ -53,31 +53,37 @@ Each week produces a self-contained module for formal verification.
 ### `firmware/secrets_to_c_header.py`
 - [x] Parse keys from secrets file
 - [x] Define canonical permission serialization (little-endian, packed)
-- [x] Compute `PERMISSION_MAC = HMAC-SHA256(AUTH_KEY, perm_count || permissions)`
-- [x] Output `secrets.h` with GCM_KEY (aligned for KEYSTORE) and AUTH_KEY (byte array)
+- [x] Compute `PERMISSION_MAC = HMAC-SHA256(AUTH_KEY, perm_count || permissions || "permission")`
+- [x] Output `secrets.h` with GCM_KEY (4-byte aligned) and AUTH_KEY (byte array)
 
 ### `firmware/inc/crypto.h`
-- [x] Define `crypto_init()` — load GCM_KEY into KEYSTORE
+- [x] Define `crypto_init()` — no-op (retained for compatibility)
 - [x] Define `aes_gcm_encrypt(nonce, aad, aad_len, plaintext, pt_len, ciphertext, tag) → int`
 - [x] Define `aes_gcm_decrypt(nonce, aad, aad_len, ciphertext, ct_len, tag, plaintext) → int`
-- [x] Define `hmac_sha256(key, data, len, output) → int` — wolfcrypt wrapper
+- [x] Define `hmac_sha256(key, data, len, domain, output) → int` — mandatory domain separator
+- [x] Define `hmac_verify(key, data, len, domain, expected) → bool` — glitch-resistant
 - [x] Define `generate_nonce(nonce) → int` — 12 bytes from TRNG
 - [x] Define constants: `GCM_KEY_SIZE 32`, `NONCE_SIZE 12`, `TAG_SIZE 16`, `HMAC_SIZE 32`
-- [x] Define KEYSTORE slot: `KEYSTORE_SLOT_GCM 0`
+- [x] Define domain separators: `HMAC_DOMAIN_SENDER`, `_RECEIVER`, `_INTERROGATE_REQ`, `_INTERROGATE_RSP`, `_PERMISSION`
+- [x] Returns `0` / `-1` only — no named error codes
 
 ### `firmware/src/crypto.c`
-- [x] Implement `crypto_init()` — load GCM_KEY into KEYSTORE slot 0
-- [x] Implement `aes_gcm_encrypt()` using hardware AESADV + KEYSTORE
-- [x] Implement `aes_gcm_decrypt()` using hardware AESADV (tag verify in hardware)
-- [x] Implement `hmac_sha256()` using wolfcrypt `wc_Hmac*` functions
+- [x] Implement `crypto_init()` — no-op (key loaded per operation)
+- [x] Implement `aes_gcm_encrypt()` — hardware AESADV, key from flash
+- [x] Implement `aes_gcm_decrypt()` — hardware AESADV, secure_compare tag verify, zero plaintext on failure
+- [x] Implement `hmac_sha256()` — wolfcrypt, mandatory domain separator
+- [x] Implement `hmac_verify()` — glitch-resistant double-compute with halt
 - [x] Implement `generate_nonce()` — 12 bytes from trng_read_byte()
-- [x] Add double-computation for GCM operations (glitch protection)
+- [x] Implement `build_storage_aad()` — slot || uuid || group_id || name (51 bytes)
+- [x] Implement `build_transfer_aad()` — recv_chal || send_chal || slot || uuid || group_id (43 bytes)
 - [x] Add random delays around crypto operations
+- [x] All failures return generic `-1` (no info leakage)
 
 ### Key Architecture
-- [x] GCM_KEY in KEYSTORE slot 0 (hardware protected, write-only)
-- [x] AUTH_KEY in flash/RAM (required for wolfcrypt HMAC)
-- [x] No software access to GCM_KEY after init
+- [x] GCM_KEY in flash (4-byte aligned, loaded into AESADV per operation)
+- [x] AUTH_KEY in flash (required for wolfcrypt HMAC)
+- [x] All HMAC operations use mandatory domain separators
+- [x] Single generic error code prevents failure-mode fingerprinting
 
 
 ---
@@ -93,7 +99,6 @@ Each week produces a self-contained module for formal verification.
 - [ ] Define AAD construction helpers
 
 ### `firmware/src/filesystem.c`
-- [ ] Implement `build_storage_aad()` — slot || uuid || group_id || name
 - [ ] Implement `secure_write_file()`:
   - [ ] Validate all inputs
   - [ ] Generate 12-byte nonce via TRNG
@@ -126,12 +131,11 @@ Each week produces a self-contained module for formal verification.
   - [ ] `challenge_response_t`: sender_challenge[12], sender_auth[32]
   - [ ] `permission_proof_t`: receiver_auth[32], perm_count, permissions[], permission_mac[32]
   - [ ] `file_data_t`: nonce[12], ciphertext[], tag[16]
-- [ ] Define HMAC domain separator constants
 
 ### HMAC Helper Functions
-- [ ] `compute_sender_auth(receiver_challenge, output)` — HMAC(AUTH_KEY, challenge || "sender")
-- [ ] `compute_receiver_auth(sender_challenge, output)` — HMAC(AUTH_KEY, challenge || "receiver")
-- [ ] `verify_permission_mac(perm_count, permissions, received_mac) → bool`
+- [ ] `compute_sender_auth(receiver_challenge, output)` — `hmac_sha256(AUTH_KEY, challenge, 12, HMAC_DOMAIN_SENDER, output)`
+- [ ] `compute_receiver_auth(sender_challenge, output)` — `hmac_sha256(AUTH_KEY, challenge, 12, HMAC_DOMAIN_RECEIVER, output)`
+- [ ] `verify_permission_mac(perm_count, permissions, received_mac) → bool` — `hmac_verify(..., HMAC_DOMAIN_PERMISSION, ...)`
 
 ### `firmware/src/commands.c` — RECEIVE Protocol
 
@@ -139,8 +143,8 @@ Each week produces a self-contained module for formal verification.
 - [ ] Generate `receiver_challenge` (12 bytes, TRNG)
 - [ ] Send `slot || receiver_challenge`
 - [ ] Receive `sender_challenge || sender_auth`
-- [ ] Verify `sender_auth = HMAC(AUTH_KEY, receiver_challenge || "sender")`
-- [ ] Compute `receiver_auth = HMAC(AUTH_KEY, sender_challenge || "receiver")`
+- [ ] Verify `sender_auth` via `hmac_verify(AUTH_KEY, receiver_challenge, 12, HMAC_DOMAIN_SENDER, sender_auth)`
+- [ ] Compute `receiver_auth` via `hmac_sha256(AUTH_KEY, sender_challenge, 12, HMAC_DOMAIN_RECEIVER, receiver_auth)`
 - [ ] Send `receiver_auth || perm_count || permissions || PERMISSION_MAC`
 - [ ] Receive `nonce || ciphertext || tag`
 - [ ] Construct transfer_AAD = receiver_challenge || sender_challenge || slot || uuid || group_id
@@ -153,12 +157,12 @@ Each week produces a self-contained module for formal verification.
 - [ ] Receive `requested_slot || receiver_challenge`
 - [ ] Validate slot, load file metadata
 - [ ] Generate `sender_challenge` (TRNG)
-- [ ] Compute `sender_auth = HMAC(AUTH_KEY, receiver_challenge || "sender")`
+- [ ] Compute `sender_auth` via `hmac_sha256(AUTH_KEY, receiver_challenge, 12, HMAC_DOMAIN_SENDER, sender_auth)`
 - [ ] Send `sender_challenge || sender_auth`
 - [ ] Receive `receiver_auth || perm_count || permissions || permission_mac` (2000ms timeout)
 - [ ] Validate `perm_count <= MAX_PERMS`
-- [ ] Verify `permission_mac = HMAC(AUTH_KEY, perm_count || permissions)`
-- [ ] Verify `receiver_auth = HMAC(AUTH_KEY, sender_challenge || "receiver")`
+- [ ] Verify `permission_mac` via `hmac_verify(AUTH_KEY, perm_data, len, HMAC_DOMAIN_PERMISSION, permission_mac)`
+- [ ] Verify `receiver_auth` via `hmac_verify(AUTH_KEY, sender_challenge, 12, HMAC_DOMAIN_RECEIVER, receiver_auth)`
 - [ ] Check RECEIVE permission exists for file's group_id in received permissions
 - [ ] Load and decrypt stored file (verify storage integrity)
 - [ ] Generate `transfer_nonce` (TRNG)
@@ -170,16 +174,16 @@ Each week produces a self-contained module for formal verification.
 
 **Requester side** (`interrogate()`):
 - [ ] Generate challenge (12 bytes, TRNG)
-- [ ] Compute `auth = HMAC(AUTH_KEY, challenge || "interrogate_req")`
+- [ ] Compute `auth` via `hmac_sha256(AUTH_KEY, challenge, 12, HMAC_DOMAIN_INTERROGATE_REQ, auth)`
 - [ ] Send `challenge || auth || perm_count || permissions || PERMISSION_MAC`
 - [ ] Receive `response_auth || filtered_list`
-- [ ] Verify `response_auth = HMAC(AUTH_KEY, challenge || filtered_list || "interrogate_resp")`
+- [ ] Verify `response_auth` via `hmac_verify(AUTH_KEY, challenge || filtered_list, len, HMAC_DOMAIN_INTERROGATE_RSP, response_auth)`
 
 **Responder side** (`listen()` INTERROGATE_MSG):
-- [ ] Receive and verify `permission_mac`
-- [ ] Verify `auth = HMAC(AUTH_KEY, challenge || "interrogate_req")`
+- [ ] Receive and verify `permission_mac` via `hmac_verify(..., HMAC_DOMAIN_PERMISSION, ...)`
+- [ ] Verify `auth` via `hmac_verify(AUTH_KEY, challenge, 12, HMAC_DOMAIN_INTERROGATE_REQ, auth)`
 - [ ] Filter file list by requester's RECEIVE permissions
-- [ ] Compute `response_auth = HMAC(AUTH_KEY, challenge || filtered_list || "interrogate_resp")`
+- [ ] Compute `response_auth` via `hmac_sha256(AUTH_KEY, challenge || filtered_list, len, HMAC_DOMAIN_INTERROGATE_RSP, response_auth)`
 - [ ] Send `response_auth || filtered_list`
 
 ### `firmware/src/host_messaging.c`

@@ -52,21 +52,21 @@
 
 | Key | Size | Storage | Purpose |
 |-----|------|---------|---------|
-| GCM_KEY | 256-bit | KEYSTORE slot 0 | File encryption + integrity (AES-256-GCM) |
+| GCM_KEY | 256-bit | Flash (secrets.h, 4-byte aligned) | File encryption + integrity (AES-256-GCM) |
 | AUTH_KEY | 256-bit | Flash (secrets.h) | Challenge-response authentication, permission binding |
 
 **Key storage rationale:**
-- GCM_KEY in KEYSTORE: Hardware write-only protection, feeds directly to AESADV
-- AUTH_KEY in flash: wolfcrypt HMAC requires key in RAM; KEYSTORE cannot export keys
+- GCM_KEY in flash (4-byte aligned): Loaded into AESADV key registers per operation via `DL_AESADV_setKeyAligned()`. Hardware KEYSTORE incompatible with secure bootloader.
+- AUTH_KEY in flash: wolfcrypt HMAC requires key accessible in memory
 
 **Per-HSM secrets (computed at build time):**
 
 | Secret | Derivation | Purpose |
 |--------|------------|---------|
-| PERMISSION_MAC | HMAC(AUTH_KEY, perm_count \|\| serialized_permissions) | Prove permissions are authentic |
+| PERMISSION_MAC | HMAC(AUTH_KEY, perm_count \|\| serialized_permissions \|\| "permission") | Prove permissions are authentic |
 
 **PIN Storage:**
-PIN stored in firmware flash (secrets.h). KEYSTORE is write-only; cannot store PIN there.
+PIN stored in firmware flash (secrets.h).
 
 **Algorithms:**
 - Encryption + Integrity: AES-256-GCM (hardware AESADV, single pass)
@@ -79,6 +79,12 @@ PIN stored in firmware flash (secrets.h). KEYSTORE is write-only; cannot store P
 2. Hardware tag verification (constant-time, no software timing leak)
 3. AAD binds metadata without encryption overhead
 4. No padding oracle vulnerabilities
+
+---
+
+## Error Handling
+
+All crypto operations return only `0` (success) or `-1` (failure). No error differentiation is exposed — parameter errors, tag failures, and hardware errors all return the same generic code. All command handlers respond with `"Operation failed"` on any error path. This prevents attackers from distinguishing failure modes to refine their attacks.
 
 ---
 
@@ -98,7 +104,7 @@ Encrypted file data (at flash_addr):
 ```
 
 **GCM parameters for file storage:**
-- Key: GCM_KEY from KEYSTORE slot 0
+- Key: GCM_KEY from flash (loaded into AESADV registers per operation)
 - Nonce: 12 bytes from TRNG (stored with file)
 - AAD: slot || uuid || group_id || name (authenticated, not encrypted)
 - Plaintext: file contents only
@@ -123,10 +129,10 @@ Encrypted file data (at flash_addr):
 4. Load encrypted data (nonce, ciphertext, tag)
 5. Reconstruct AAD = slot || uuid || group_id || name
 6. plaintext = AES-256-GCM-Decrypt(GCM_KEY, nonce, AAD, ciphertext, tag)
-7. If tag verification fails → treat as corrupted, return error
+7. If tag verification fails → return generic error
 8. Verify loaded group_id matches permission-checked group_id (TOCTOU defense)
 9. Return name + plaintext contents
-10. explicit_bzero() all sensitive buffers
+10. secure_zero() all sensitive buffers
 ```
 
 **Integrity failure handling:** 
@@ -192,7 +198,7 @@ If GCM tag verification fails, treat slot as empty/corrupted. Do not reveal whic
 
 7. Receive PERMISSION_PROOF: receiver_auth || perm_count || permissions || permission_mac (2000ms timeout)
 8. Validate perm_count <= MAX_PERMS
-9. Verify permission_mac = HMAC(AUTH_KEY, perm_count || serialized_permissions)
+9. Verify permission_mac = HMAC(AUTH_KEY, perm_count || serialized_permissions || "permission")
 10. Verify receiver_auth = HMAC(AUTH_KEY, sender_challenge || "receiver")
 11. Iterate permissions[0..perm_count-1], verify RECEIVE exists for file's group_id
 12. If any check fails → abort with generic error
@@ -231,7 +237,7 @@ If GCM tag verification fails, treat slot as empty/corrupted. Do not reveal whic
 ```
 1. Receive INTERROGATE_REQUEST: challenge || auth || perm_count || permissions || permission_mac
 2. Validate perm_count <= MAX_PERMS
-3. Verify permission_mac = HMAC(AUTH_KEY, perm_count || serialized_permissions)
+3. Verify permission_mac = HMAC(AUTH_KEY, perm_count || serialized_permissions || "permission")
 4. Verify auth = HMAC(AUTH_KEY, challenge || "interrogate_req")
 5. Filter file_list: include only files where requester has RECEIVE for file's group_id
 6. Compute response_auth = HMAC(AUTH_KEY, challenge || filtered_list || "interrogate_resp")
@@ -308,8 +314,7 @@ bool check_pin(uint8_t *input) {
         result1 |= input[i] ^ stored_pin[i];
     
     // Random delay to desynchronize glitch attempts
-    volatile uint8_t delay = trng_read_byte() & 0x7F;
-    for (volatile int j = 0; j < delay; j++) { __asm("nop"); }
+    random_delay();
     
     // Second pass: detect single-glitch bypass
     for (int i = 0; i < PIN_LENGTH; i++)
@@ -334,8 +339,8 @@ bool check_pin(uint8_t *input) {
 | Attack | Mitigation |
 |--------|------------|
 | Brute force PIN | 5s delay per failed attempt; constant-time comparison |
-| Timing attacks | Hardware GCM tag verify; secure_compare for HMAC; consistent error timing |
-| Key extraction (GCM) | Hardware KEYSTORE (write-only); GCM_KEY never in software |
+| Timing attacks | Hardware GCM + secure_compare tag verify; single generic error code on all failures |
+| Key extraction (GCM) | GCM_KEY in flash; loaded into AESADV registers only during operations |
 | Key extraction (AUTH) | AUTH_KEY in flash; minimize time in RAM during HMAC |
 | Permission forgery | PERMISSION_MAC verification; perm_count bounds check |
 | Rogue device injection | Mutual authentication via HMAC challenge-response |
@@ -345,8 +350,9 @@ bool check_pin(uint8_t *input) {
 | TOCTOU | Re-verify group_id after load, before return |
 | Nonce reuse | 12-byte TRNG nonce per operation |
 | Group ID manipulation | group_id in AAD; tag fails if modified |
-| Glitch attacks | Double-check with random delay; halt on mismatch |
+| Glitch attacks | Random delays around crypto ops; PIN and HMAC-verify double-check with halt on mismatch |
 | Buffer overflow | Strict length validation; safe memcpy wrappers |
+| Error oracle | Single generic error code and message on all failure paths |
 
 ---
 
@@ -375,7 +381,7 @@ Offset  Size  Field
 
 ## HMAC Domain Separation
 
-All HMAC operations include a domain separator string to prevent cross-protocol attacks:
+All HMAC operations use a mandatory domain separator appended to the data before computation. There is one unified `hmac_sha256(key, data, len, domain, output)` function — no domain-less variant exists. This prevents cross-protocol attacks by construction.
 
 | Context | HMAC Input |
 |---------|------------|
@@ -383,4 +389,11 @@ All HMAC operations include a domain separator string to prevent cross-protocol 
 | Receiver auth | `sender_challenge \|\| "receiver"` |
 | Interrogate request | `challenge \|\| "interrogate_req"` |
 | Interrogate response | `challenge \|\| file_list \|\| "interrogate_resp"` |
-| Permission MAC | `perm_count \|\| serialized_permissions` (no separator, build-time) |
+| Permission MAC | `perm_count \|\| serialized_permissions \|\| "permission"` |
+
+Domain separator constants defined in `crypto.h`:
+- `HMAC_DOMAIN_SENDER` = `"sender"`
+- `HMAC_DOMAIN_RECEIVER` = `"receiver"`
+- `HMAC_DOMAIN_INTERROGATE_REQ` = `"interrogate_req"`
+- `HMAC_DOMAIN_INTERROGATE_RSP` = `"interrogate_resp"`
+- `HMAC_DOMAIN_PERMISSION` = `"permission"`
