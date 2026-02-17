@@ -87,7 +87,7 @@ NAME = hsm
 
 CFLAGS += -I.. \
     -D__MSPM0L2228__ \
-    -O2 \
+    -O0 \
     "-I$(MSPM0_SDK_INSTALL_DIR)/source/third_party/CMSIS/Core/Include" \
     "-I$(MSPM0_SDK_INSTALL_DIR)/source" \
     "-I./inc" \
@@ -131,7 +131,7 @@ $(WOLFSSL_SRC)/%.o: $(WOLFSSL_SRC)/%.c
 
 $(BUILDDIR)/$(NAME).elf: $(OBJECTS)
 	@ echo Linking $@
-	@ $(LNK) -Wl,-O3 $(OBJECTS) $(LFLAGS) -o $@
+	@ $(LNK) -Wl,-u,_c_int00 $(OBJECTS) $(LFLAGS) -o $@
 
 $(BUILDDIR)/$(NAME).bin: $(BUILDDIR)/$(NAME).elf
 	@ $(OBJCOPY) -O binary $< $@
