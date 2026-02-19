@@ -25,7 +25,7 @@ ENV TICLANG_ARMCOMPILER=/opt/ti-cgt-armllvm_4.0.3.LTS
 # Install MSPM0 SDK
 RUN wget https://github.com/TexasInstruments/mspm0-sdk/archive/refs/tags/mspm0_sdk_2_06_00_05.zip && \
     unzip mspm0_sdk_2_06_00_05.zip -d /opt && \
-    rm -f -r mspm0_sdk_2_06_00_05.zip ${MSPM0_SDK_INSTALL_DIR}/docs # ${MSPM0_SDK_INSTALL_DIR}/examples
+    rm -f -r mspm0_sdk_2_06_00_05.zip ${MSPM0_SDK_INSTALL_DIR}/docs ${MSPM0_SDK_INSTALL_DIR}/examples
 
 # Install TI-Clang for curr machine's arch
 RUN if [ $(uname -m) = "x86_64" ]; then \

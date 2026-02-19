@@ -1,7 +1,13 @@
 /**
  * @file HSM.c
- * @brief Boot code and main function for the HSM
+ * @brief Boot code and main dispatch loop for the HSM
  * @date 2026
+ *
+ * Week 4 hardening: removed boot_flag(), obfuscated arrays, crypto_example(),
+ * and all debug/verbose error prints from the dispatch loop.
+ * All error paths emit only the generic "Operation failed" message via
+ * the command handlers themselves.
+ *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 
@@ -15,57 +21,50 @@
 #include "ti_msp_dl_config.h"
 #include "status_led.h"
 #include "simple_uart.h"
-#include "security.h"
+
+/**********************************************************
+ ************************ GLOBALS *************************
+ **********************************************************/
 
 static unsigned char uart_buf[MAX_MSG_SIZE];
 
-/**
- * @brief Initialize peripherals for system boot
- */
-void init(void)
+/**********************************************************
+ ********************* CORE FUNCTIONS *********************
+ **********************************************************/
+
+/** @brief Initialize hardware peripherals. */
+static void init(void)
 {
     SYSCFG_DL_init();
     init_fs();
-
-    /* TRNG is required for security functions */
-    int trng_result = trng_init();
-    if (trng_result != 0) {
-        /* Halt with error blink pattern */
-        while (1) {
-            for (int i = 0; i < (-trng_result); i++) {
-                STATUS_LED_ON();
-                delay_ms(100);
-                STATUS_LED_OFF();
-                delay_ms(100);
-            }
-            delay_ms(500);
-        }
-    }
 }
+
+/**********************************************************
+ *********************** MAIN LOOP ************************
+ **********************************************************/
 
 int main(void)
 {
     msg_type_t cmd;
-    int result;
-    uint16_t pkt_len;
+    uint16_t   pkt_len;
+    int        result;
 
     init();
 
-    /* Main command processing loop */
     while (1) {
         STATUS_LED_ON();
 
         pkt_len = 0;
-        result = read_packet(CONTROL_INTERFACE, &cmd, uart_buf, &pkt_len);
+        result  = read_packet(CONTROL_INTERFACE, &cmd, uart_buf, &pkt_len);
 
         if (result != MSG_OK) {
             STATUS_LED_OFF();
+            print_error("Operation failed");
             continue;
         }
 
         STATUS_LED_OFF();
 
-        /* Handle the requested command */
         switch (cmd) {
         case LIST_MSG:
             list(pkt_len, uart_buf);
@@ -92,6 +91,7 @@ int main(void)
             break;
 
         default:
+            print_error("Operation failed");
             break;
         }
     }

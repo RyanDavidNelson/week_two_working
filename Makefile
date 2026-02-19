@@ -1,6 +1,6 @@
 # This file is a helper script to make repetitive build actions easier
 # Invoking `make docker` will build the docker image.
-# `make docker-nc` will build the docker image without using the Docker cache.
+# `make docker-nc` will build the docker image without using e Docker cache.
 # `make secrets` will generate secrets for group 1234.
 # `make firmware` will make the firmware image.
 # `make clean` will remove build artifacts, both in the firmware

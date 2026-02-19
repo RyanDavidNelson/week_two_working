@@ -1,51 +1,76 @@
 /**
- * @file "simple_uart.c"
- * @author Samuel Meyers
- * @brief UART Interrupt Handler Implementation
+ * @file simple_uart.c
+ * @brief UART Driver Implementation
  * @date 2026
  *
- * This source file is part of an example system for MITRE's 2026 Embedded CTF (eCTF).
- * This code is being provided only for educational purposes for the 2026 MITRE eCTF competition,
- * and may not meet MITRE standards for quality. Use this code at your own risk!
+ * Week 4: uart_readbyte() polls with a 2000ms per-byte timeout.
+ * Uses delay_ms() from security.h (which calls delay_cycles()) instead of
+ * a duplicate busy-wait implementation, so timing is consistent with all
+ * other security-critical delays in the firmware.
  *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 
 #include "simple_uart.h"
+#include "security.h"   /* delay_ms(), CYCLES_PER_MS */
+
+/**********************************************************
+ *************** CONFIGURATION ****************************
+ **********************************************************/
+
+/* Maximum time to wait for a single byte, in milliseconds */
+#define UART_TIMEOUT_MS  2000UL
 
 /**********************************************************
  *************** HARDWARE ABSTRACTIONS ********************
  **********************************************************/
 
-// This holds the two UART configurations necessary for communication
-UART_Regs *uart_inst[] = {UART_0_INST, UART_1_INST};
+/* Peripheral handles for the two UART instances */
+static UART_Regs *uart_inst[] = { UART_0_INST, UART_1_INST };
 
-UART_Regs *get_uart_handle(int uart_id) {
-    if (uart_id < 0 || uart_id > CONFIG_UART_COUNT) {
-        // Default on bad input is 0
-        return uart_inst[0];
+static UART_Regs *get_uart_handle(int uart_id)
+{
+    if (uart_id < 0 || uart_id >= CONFIG_UART_COUNT) {
+        return uart_inst[0]; /* safe default on bad index */
     }
-    else {
-        return uart_inst[uart_id];
-    }
+    return uart_inst[uart_id];
 }
 
-/** @brief Reads the next available character from UART.
+/**
+ * @brief Read one byte from UART with a 2000ms timeout.
  *
- *  @param uart_id The index of UART to use
- *  @return The character read.
-*/
-int uart_readbyte(int uart_id){
-    uint8_t data = DL_UART_receiveDataBlocking(get_uart_handle(uart_id));
-    return data;
+ * Polls DL_UART_isRXFIFOEmpty() in 1ms steps using delay_ms() from
+ * security.c, which is the same calibrated busy-wait used for PIN delays
+ * and random delays.  Returns -1 on timeout so the protocol layer can
+ * return a clean error instead of hanging indefinitely.
+ *
+ * @param uart_id  Index of UART peripheral (0 = CONTROL, 1 = TRANSFER).
+ * @return         Byte value 0-255 on success, -1 on timeout.
+ */
+int uart_readbyte(int uart_id)
+{
+    UART_Regs *uart = get_uart_handle(uart_id);
+    uint32_t elapsed_ms = 0;
+
+    /* Poll in 1ms increments using the shared delay primitive */
+    while (DL_UART_isRXFIFOEmpty(uart)) {
+        delay_ms(1);
+        elapsed_ms++;
+        if (elapsed_ms >= UART_TIMEOUT_MS) {
+            return -1; /* timeout */
+        }
+    }
+
+    return (int)DL_UART_receiveData(uart);
 }
 
-/** @brief Writes a byte to UART.
+/**
+ * @brief Write one byte to UART (blocking transmit).
  *
- *  @param uart_id The index of UART to use
- *  @param data The byte to be written.
-*/
-void uart_writebyte(int uart_id, uint8_t data) {
+ * @param uart_id  Index of UART peripheral.
+ * @param data     Byte to transmit.
+ */
+void uart_writebyte(int uart_id, uint8_t data)
+{
     DL_UART_transmitDataBlocking(get_uart_handle(uart_id), data);
 }
-

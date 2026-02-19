@@ -44,7 +44,7 @@ CFLAGS += -DWC_NO_HASHDRBG
 CFLAGS += -DHAVE_PK_CALLBACKS
 CFLAGS += -DWOLFSSL_USER_IO
 CFLAGS += -DWC_NO_DEFAULT_DEVID
-CFLAGS += -DWOLF_CRYPTO_CB
+CFLAGS += -DNO_CRYPTO_CB
 
 # Disable ALL unused algorithms (we only need SHA256 + HMAC)
 CFLAGS += -DNO_MD4
@@ -71,14 +71,15 @@ CFLAGS += -DNO_SIG_WRAPPER
 CFLAGS += -I./wolfssl
 
 # =============================================================================
-# WolfSSL source objects for HMAC-SHA256
+# WolfSSL source objects — compiled into BUILDDIR (not the source tree) so
+# stale .o files never accumulate in the mounted host volume between builds.
 # =============================================================================
 WOLFSSL_SRC = wolfssl/wolfcrypt/src
-OBJECTS += $(WOLFSSL_SRC)/sha256.o
-OBJECTS += $(WOLFSSL_SRC)/hmac.o
-OBJECTS += $(WOLFSSL_SRC)/hash.o
-OBJECTS += $(WOLFSSL_SRC)/memory.o
-OBJECTS += $(WOLFSSL_SRC)/wc_port.o
+OBJECTS += $(BUILDDIR)/sha256.so \
+           $(BUILDDIR)/hmac.so \
+           $(BUILDDIR)/hash.so \
+           $(BUILDDIR)/memory.so \
+           $(BUILDDIR)/wc_port.so
 
 # =============================================================================
 # Compiler flags
@@ -120,12 +121,13 @@ all: $(BUILDDIR)/$(NAME).elf $(BUILDDIR)/$(NAME).bin
 $(BUILDDIR):
 	@ mkdir -p $(BUILDDIR)
 
+# Firmware source files → BUILDDIR
 $(BUILDDIR)/%.so: ./src/%.c | $(BUILDDIR)
 	@ echo Building $@
 	@ $(CC) $(CFLAGS) -c $< -o $@
 
-# WolfSSL objects compile rule
-$(WOLFSSL_SRC)/%.o: $(WOLFSSL_SRC)/%.c
+# WolfSSL source files → BUILDDIR (separate rule for the wolfssl source path)
+$(BUILDDIR)/%.so: $(WOLFSSL_SRC)/%.c | $(BUILDDIR)
 	@ echo Building WolfSSL: $@
 	@ $(CC) $(CFLAGS) -c $< -o $@
 
@@ -138,6 +140,5 @@ $(BUILDDIR)/$(NAME).bin: $(BUILDDIR)/$(NAME).elf
 
 clean:
 	@ rm -rf $(BUILDDIR)
-	@ rm -f $(WOLFSSL_SRC)/*.o
 
 .PHONY: all clean
