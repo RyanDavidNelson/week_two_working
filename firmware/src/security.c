@@ -2,6 +2,15 @@
  * @file security.c
  * @brief Security primitives implementation for eCTF HSM
  * @date 2026
+ *
+ * Fix #7: validate_permission() now iterates PERM_COUNT (from secrets.h)
+ * instead of MAX_PERMS.  Iterating the padding entries is a logic error:
+ * if a padding entry ever had a non-zero group_id due to flash corruption
+ * or a provisioning mistake it would produce a spurious permission match.
+ *
+ * All TRNG polling loops now use a bounded counter with security_halt() on
+ * expiry, consistent with the AES peripheral loops in crypto.c.
+ *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 
@@ -12,13 +21,15 @@
 #include <ti/driverlib/dl_trng.h>
 #include <ti/devices/msp/msp.h>
 
+/* Maximum iterations for TRNG busy-wait polls. */
+#define TRNG_POLL_LIMIT 1000000UL
+
 /*
  * Timing Functions
  */
 
 void delay_cycles(uint32_t cycles)
 {
-    /* Assembly delay from TI SDK dl_common.c - cycle-accurate timing */
     uint32_t scratch;
     __asm volatile(
 #ifdef __GNUC__
@@ -35,7 +46,7 @@ void delay_cycles(uint32_t cycles)
 
 void delay_ms(uint32_t ms)
 {
-    /* Split into 100ms chunks to avoid uint32_t overflow for large delays */
+    /* Split into 100ms chunks to avoid uint32_t overflow for large delays. */
     while (ms >= 100) {
         delay_cycles(100 * CYCLES_PER_MS);
         ms -= 100;
@@ -47,9 +58,9 @@ void delay_ms(uint32_t ms)
 
 void random_delay(void)
 {
-    /* Random delay 0 to ~4ms for glitch resistance */
-    uint32_t delay = (trng_read_byte() & 0x7F) * (CYCLES_PER_MS / 8);
-    delay_cycles(delay);
+    /* 0-~4ms random jitter for glitch desynchronisation. */
+    uint32_t jitter = (trng_read_byte() & 0x7F) * (CYCLES_PER_MS / 8);
+    delay_cycles(jitter);
 }
 
 /*
@@ -59,17 +70,17 @@ void random_delay(void)
 void secure_zero(void *ptr, size_t len)
 {
     volatile uint8_t *p = (volatile uint8_t *)ptr;
-
-    for (size_t i = 0; i < len; i++) {
+    size_t i;
+    for (i = 0; i < len; i++) {
         p[i] = 0;
     }
 }
 
 void security_halt(void)
-   {
-       __disable_irq();
-       while (1) { __asm volatile("nop"); }
-   }
+{
+    __disable_irq();
+    while (1) { __asm volatile("nop"); }
+}
 
 /*
  * Hardware TRNG Functions
@@ -77,7 +88,8 @@ void security_halt(void)
 
 int trng_init(void)
 {
-    /* Enable power and wait for stabilization */
+    uint32_t poll_i;
+
     DL_TRNG_enablePower(TRNG);
 #ifdef POWER_STARTUP_DELAY
     delay_cycles(POWER_STARTUP_DELAY);
@@ -85,26 +97,28 @@ int trng_init(void)
     delay_cycles(32000);
 #endif
 
-    /* Set clock divider (32MHz / 2 = 16MHz for TRNG) */
     DL_TRNG_setClockDivider(TRNG, DL_TRNG_CLOCK_DIVIDE_2);
 
-    /* Digital self-test */
+    /* Digital self-test. */
     DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_TEST_DIG);
-    while (!DL_TRNG_isCommandDone(TRNG))
-        ;
+    for (poll_i = 0; poll_i < TRNG_POLL_LIMIT; poll_i++) {
+        if (DL_TRNG_isCommandDone(TRNG)) break;
+    }
+    if (poll_i >= TRNG_POLL_LIMIT) { security_halt(); }
     DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CMD_DONE_EVENT);
 
-    /* Must delay before reading test results (per TI documentation) */
     delay_cycles(100000);
 
     if (DL_TRNG_getDigitalHealthTestResults(TRNG) != DL_TRNG_DIGITAL_HEALTH_TEST_SUCCESS) {
         return -1;
     }
 
-    /* Analog self-test */
+    /* Analog self-test. */
     DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_TEST_ANA);
-    while (!DL_TRNG_isCommandDone(TRNG))
-        ;
+    for (poll_i = 0; poll_i < TRNG_POLL_LIMIT; poll_i++) {
+        if (DL_TRNG_isCommandDone(TRNG)) break;
+    }
+    if (poll_i >= TRNG_POLL_LIMIT) { security_halt(); }
     DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CMD_DONE_EVENT);
 
     delay_cycles(100000);
@@ -113,10 +127,12 @@ int trng_init(void)
         return -2;
     }
 
-    /* Enter normal operation mode */
+    /* Enter normal operation. */
     DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
-    while (!DL_TRNG_isCommandDone(TRNG))
-        ;
+    for (poll_i = 0; poll_i < TRNG_POLL_LIMIT; poll_i++) {
+        if (DL_TRNG_isCommandDone(TRNG)) break;
+    }
+    if (poll_i >= TRNG_POLL_LIMIT) { security_halt(); }
     DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CMD_DONE_EVENT);
 
     DL_TRNG_setDecimationRate(TRNG, DL_TRNG_DECIMATION_RATE_4);
@@ -126,14 +142,18 @@ int trng_init(void)
 
 uint32_t trng_read_word(void)
 {
-    /* Wait for capture to be ready */
-    while (!DL_TRNG_isCaptureReady(TRNG))
-        ;
+    uint32_t poll_i;
+
+    /* Bounded poll — halt if the peripheral stalls (e.g. after a glitch). */
+    for (poll_i = 0; poll_i < TRNG_POLL_LIMIT; poll_i++) {
+        if (DL_TRNG_isCaptureReady(TRNG)) break;
+    }
+    if (poll_i >= TRNG_POLL_LIMIT) { security_halt(); }
 
     uint32_t value = DL_TRNG_getCapture(TRNG);
     DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CAPTURE_RDY_EVENT);
 
-    /* Trigger next capture (TRNG doesn't auto-generate) */
+    /* Trigger the next capture. */
     DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
 
     return value;
@@ -141,16 +161,16 @@ uint32_t trng_read_word(void)
 
 uint8_t trng_read_byte(void)
 {
-    static uint32_t cached_word = 0;
-    static uint8_t bytes_remaining = 0;
+    static uint32_t cached_word     = 0;
+    static uint8_t  bytes_remaining = 0;
 
     if (bytes_remaining == 0) {
-        cached_word = trng_read_word();
+        cached_word     = trng_read_word();
         bytes_remaining = 4;
     }
 
-    uint8_t result = (uint8_t)(cached_word & 0xFF);
-    cached_word >>= 8;
+    uint8_t result  = (uint8_t)(cached_word & 0xFF);
+    cached_word   >>= 8;
     bytes_remaining--;
 
     return result;
@@ -165,8 +185,9 @@ bool secure_compare(const void *a, const void *b, size_t len)
     const volatile uint8_t *pa = (const volatile uint8_t *)a;
     const volatile uint8_t *pb = (const volatile uint8_t *)b;
     volatile uint8_t result = 0;
+    size_t i;
 
-    for (size_t i = 0; i < len; i++) {
+    for (i = 0; i < len; i++) {
         result |= pa[i] ^ pb[i];
     }
 
@@ -177,28 +198,26 @@ bool check_pin(unsigned char *pin)
 {
     volatile uint8_t result1 = 0;
     volatile uint8_t result2 = 0;
+    int i, j;
 
-    /* First comparison pass */
-    for (int i = 0; i < PIN_LENGTH; i++) {
+    /* First comparison pass. */
+    for (i = 0; i < PIN_LENGTH; i++) {
         result1 |= pin[i] ^ HSM_PIN[i];
     }
 
-    /* Random delay between checks for glitch resistance */
     random_delay();
 
-    /* Second comparison pass */
-    for (int j = 0; j < PIN_LENGTH; j++) {
+    /* Second comparison pass. */
+    for (j = 0; j < PIN_LENGTH; j++) {
         result2 |= pin[j] ^ HSM_PIN[j];
     }
 
-    /* Glitch detection: halt if results differ */
+    /* Halt if passes disagree — indicates a glitch attempt. */
     if (result1 != result2) {
-        while (1) {
-            __asm volatile("nop");
-        }
+        security_halt();
     }
 
-    /* Rate-limit brute force with 5-second delay on wrong PIN */
+    /* 5-second delay on wrong PIN to rate-limit brute force. */
     if (result1 != 0) {
         delay_ms(5000);
         return false;
@@ -211,24 +230,23 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
 {
     volatile bool found_pass1 = false;
     volatile bool found_pass2 = false;
+    int i, j;
 
-    /* First pass */
-    for (int i = 0; i < MAX_PERMS; i++) {
+    /* FIX #7: iterate PERM_COUNT (actual provisioned entries, from secrets.h)
+     * not MAX_PERMS (the full array capacity including zero-padded slots).
+     * Iterating padding entries is a logic error — a corrupt padding entry
+     * with a non-zero group_id would produce a spurious permission grant. */
+
+    /* First pass. */
+    for (i = 0; i < PERM_COUNT; i++) {
         bool group_match = (global_permissions[i].group_id == group_id);
-        bool has_perm = false;
+        bool has_perm    = false;
 
         switch (perm) {
-        case PERM_READ:
-            has_perm = global_permissions[i].read;
-            break;
-        case PERM_WRITE:
-            has_perm = global_permissions[i].write;
-            break;
-        case PERM_RECEIVE:
-            has_perm = global_permissions[i].receive;
-            break;
-        default:
-            break;
+        case PERM_READ:    has_perm = global_permissions[i].read;    break;
+        case PERM_WRITE:   has_perm = global_permissions[i].write;   break;
+        case PERM_RECEIVE: has_perm = global_permissions[i].receive; break;
+        default: break;
         }
 
         if (group_match && has_perm) {
@@ -236,26 +254,18 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
         }
     }
 
-    /* Random delay for glitch resistance */
     random_delay();
 
-    /* Second pass */
-    for (int j = 0; j < MAX_PERMS; j++) {
+    /* Second pass. */
+    for (j = 0; j < PERM_COUNT; j++) {
         bool group_match = (global_permissions[j].group_id == group_id);
-        bool has_perm = false;
+        bool has_perm    = false;
 
         switch (perm) {
-        case PERM_READ:
-            has_perm = global_permissions[j].read;
-            break;
-        case PERM_WRITE:
-            has_perm = global_permissions[j].write;
-            break;
-        case PERM_RECEIVE:
-            has_perm = global_permissions[j].receive;
-            break;
-        default:
-            break;
+        case PERM_READ:    has_perm = global_permissions[j].read;    break;
+        case PERM_WRITE:   has_perm = global_permissions[j].write;   break;
+        case PERM_RECEIVE: has_perm = global_permissions[j].receive; break;
+        default: break;
         }
 
         if (group_match && has_perm) {
@@ -263,11 +273,9 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
         }
     }
 
-    /* Glitch detection */
+    /* Halt if passes disagree. */
     if (found_pass1 != found_pass2) {
-        while (1) {
-            __asm volatile("nop");
-        }
+        security_halt();
     }
 
     return found_pass1;
@@ -284,24 +292,26 @@ bool validate_slot(uint8_t slot)
 
 bool validate_name(const char *name, size_t max_len)
 {
+    size_t i;
+
     if (name == NULL) {
         return false;
     }
 
-    for (size_t i = 0; i < max_len; i++) {
+    for (i = 0; i < max_len; i++) {
         char c = name[i];
 
         if (c == '\0') {
-            return (i > 0); /* Must have at least one character */
+            return (i > 0); /* Must have at least one printable character. */
         }
 
-        /* Only allow printable ASCII (0x20-0x7E) */
+        /* Printable ASCII only: 0x20 (space) through 0x7E (~). */
         if (c < 0x20 || c > 0x7E) {
             return false;
         }
     }
 
-    return false; /* No null terminator found */
+    return false; /* No null terminator within max_len — reject. */
 }
 
 bool validate_perm_count(uint8_t count)

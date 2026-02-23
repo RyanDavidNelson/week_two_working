@@ -3,10 +3,13 @@
  * @brief Boot code and main dispatch loop for the HSM
  * @date 2026
  *
- * Week 4 hardening: removed boot_flag(), obfuscated arrays, crypto_example(),
- * and all debug/verbose error prints from the dispatch loop.
- * All error paths emit only the generic "Operation failed" message via
- * the command handlers themselves.
+ * Fix #1 (buffer overflow): pkt_len is now initialised to sizeof(uart_buf)
+ * (== MAX_MSG_SIZE) instead of 0.  read_packet() uses it as the hard cap on
+ * header.len before calling read_bytes(), so an attacker-supplied length > 
+ * MAX_MSG_SIZE is rejected with MSG_BAD_LEN before any bytes are read.
+ *
+ * Week 4 hardening: boot_flag(), obfuscated arrays, and crypto_example()
+ * removed.  All error paths emit only the generic "Operation failed" message.
  *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
@@ -26,6 +29,7 @@
  ************************ GLOBALS *************************
  **********************************************************/
 
+/* Single receive buffer.  MAX_MSG_SIZE == sizeof(write_command_t). */
 static unsigned char uart_buf[MAX_MSG_SIZE];
 
 /**********************************************************
@@ -54,7 +58,10 @@ int main(void)
     while (1) {
         STATUS_LED_ON();
 
-        pkt_len = 0;
+        /* FIX #1: pass the true buffer capacity so read_packet() rejects any
+         * header.len > MAX_MSG_SIZE before reading any body bytes.
+         * Previously this was 0, which disabled the bounds check entirely. */
+        pkt_len = (uint16_t)sizeof(uart_buf);
         result  = read_packet(CONTROL_INTERFACE, &cmd, uart_buf, &pkt_len);
 
         if (result != MSG_OK) {
