@@ -1,7 +1,10 @@
 /**
  * @file secrets.h
- * @brief HSM deployment secrets (auto-generated)
+ * @brief HSM deployment secrets — extern declarations (auto-generated)
  * @warning DO NOT COMMIT TO VERSION CONTROL
+ *
+ * FIX B: PIN_HMAC replaces raw HSM_PIN.
+ * FIX D: extern const declarations only; definitions in secrets.c.
  */
 
 #ifndef __SECRETS_H__
@@ -10,46 +13,21 @@
 #include "security.h"
 #include <stdint.h>
 
-#define HSM_PIN "123456"
-
 #define PERM_COUNT 1
 
 /* AES-256-GCM key (4-byte aligned for AESADV register load). */
-static const uint8_t GCM_KEY[32] __attribute__((aligned(4))) = {
-    0x92, 0x09, 0x85, 0xc7, 0xc2, 0xe8, 0xe7, 0xfb,
-    0xaf, 0xa3, 0x45, 0x8a, 0x79, 0x88, 0xfb, 0x98,
-    0x87, 0xa9, 0x72, 0x6b, 0x0a, 0x27, 0x93, 0xa8,
-    0x49, 0xcd, 0x8b, 0x1a, 0xbc, 0x8d, 0x17, 0xfe,
-};
+extern const uint8_t GCM_KEY[32];
 
 /* HMAC-SHA256 authentication key. */
-static const uint8_t AUTH_KEY[32] = {
-    0xbb, 0x00, 0x0c, 0x30, 0x2d, 0xfe, 0x40, 0xe8,
-    0xab, 0x6e, 0xfd, 0x19, 0x5a, 0x32, 0x10, 0x76,
-    0x31, 0x6a, 0x5c, 0x5c, 0x0f, 0x55, 0xa3, 0xb4,
-    0x64, 0xb1, 0x78, 0x5b, 0x1a, 0x56, 0x0c, 0x6a,
-};
+extern const uint8_t AUTH_KEY[32];
 
 /* HMAC(AUTH_KEY, perm_count || permissions || "permission"). */
-static const uint8_t PERMISSION_MAC[32] = {
-    0x50, 0x7e, 0x6e, 0x34, 0x46, 0xd4, 0x01, 0x65,
-    0xde, 0x48, 0x19, 0x06, 0x94, 0x14, 0x78, 0x74,
-    0xe6, 0x5e, 0xf3, 0xba, 0xb3, 0x31, 0x25, 0xd5,
-    0x93, 0x14, 0x4b, 0x55, 0xf8, 0x90, 0xa4, 0xf6,
-};
+extern const uint8_t PERMISSION_MAC[32];
 
-/* Permission table — PERM_COUNT active entries, remainder zero-padded.
- * NOTE Fix #8: to eliminate per-TU copies, declare extern const here
- * and define in secrets.c, then add secrets.c to Makefile SRCS. */
-const static group_permission_t global_permissions[MAX_PERMS] = {
-	{0x1234, true, true, true},
-	{0x0000, false, false, false},
-	{0x0000, false, false, false},
-	{0x0000, false, false, false},
-	{0x0000, false, false, false},
-	{0x0000, false, false, false},
-	{0x0000, false, false, false},
-	{0x0000, false, false, false},
-};
+/* HMAC(AUTH_KEY, pin_bytes || "pin"). FIX B: replaces raw HSM_PIN. */
+extern const uint8_t PIN_HMAC[32];
+
+/* Permission table — PERM_COUNT active entries, remainder zero-padded. */
+extern const group_permission_t global_permissions[MAX_PERMS];
 
 #endif  /* __SECRETS_H__ */

@@ -21,7 +21,8 @@ OBJECTS = $(BUILDDIR)/HSM.so \
     $(BUILDDIR)/security.so \
     $(BUILDDIR)/filesystem.so \
     $(BUILDDIR)/commands.so \
-    $(BUILDDIR)/crypto.so
+    $(BUILDDIR)/crypto.so \
+    $(BUILDDIR)/secrets.so
 
 # =============================================================================
 # WolfSSL Configuration - HMAC-SHA256 only (no TLS)
@@ -121,7 +122,7 @@ all: $(BUILDDIR)/$(NAME).elf $(BUILDDIR)/$(NAME).bin
 $(BUILDDIR):
 	@ mkdir -p $(BUILDDIR)
 
-# Firmware source files → BUILDDIR
+# Firmware source files (src/*.c) → BUILDDIR
 $(BUILDDIR)/%.so: ./src/%.c | $(BUILDDIR)
 	@ echo Building $@
 	@ $(CC) $(CFLAGS) -c $< -o $@

@@ -3,18 +3,24 @@
  * @brief Security primitives implementation for eCTF HSM
  * @date 2026
  *
- * Fix #7: validate_permission() now iterates PERM_COUNT (from secrets.h)
- * instead of MAX_PERMS.  Iterating the padding entries is a logic error:
- * if a padding entry ever had a non-zero group_id due to flash corruption
- * or a provisioning mistake it would produce a spurious permission match.
+ * FIX A (P1/P2): SECURE_PIN_CHECK and SECURE_BOOL_CHECK macros (in security.h)
+ *   harden every call site branch.  This file implements the underlying
+ *   single-evaluation primitives; the double-evaluation happens at the macro
+ *   expansion in commands.c.
  *
- * All TRNG polling loops now use a bounded counter with security_halt() on
- * expiry, consistent with the AES peripheral loops in crypto.c.
+ * FIX B (P3/P6): check_pin_cmp() replaces direct XOR comparison.
+ *   It computes HMAC(AUTH_KEY, input_pin || "pin") and compares with the
+ *   stored PIN_HMAC constant.  The raw PIN string is no longer in .rodata;
+ *   an attacker who dumps flash obtains only the HMAC output, which gives
+ *   no direct XOR target for classical CPA.  The wolfcrypt SHA-256
+ *   compression function mixes the PIN bits through non-linear S-boxes,
+ *   breaking single-byte Hamming-weight correlation.
  *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 
 #include "security.h"
+#include "crypto.h"
 #include "secrets.h"
 #include "filesystem.h"
 #include "ti_msp_dl_config.h"
@@ -46,7 +52,7 @@ void delay_cycles(uint32_t cycles)
 
 void delay_ms(uint32_t ms)
 {
-    /* Split into 100ms chunks to avoid uint32_t overflow for large delays. */
+    /* Split into 100ms chunks to avoid uint32_t overflow. */
     while (ms >= 100) {
         delay_cycles(100 * CYCLES_PER_MS);
         ms -= 100;
@@ -58,7 +64,7 @@ void delay_ms(uint32_t ms)
 
 void random_delay(void)
 {
-    /* 0-~4ms random jitter for glitch desynchronisation. */
+    /* 0–~4 ms random jitter for glitch desynchronisation. */
     uint32_t jitter = (trng_read_byte() & 0x7F) * (CYCLES_PER_MS / 8);
     delay_cycles(jitter);
 }
@@ -109,7 +115,8 @@ int trng_init(void)
 
     delay_cycles(100000);
 
-    if (DL_TRNG_getDigitalHealthTestResults(TRNG) != DL_TRNG_DIGITAL_HEALTH_TEST_SUCCESS) {
+    if (DL_TRNG_getDigitalHealthTestResults(TRNG) !=
+            DL_TRNG_DIGITAL_HEALTH_TEST_SUCCESS) {
         return -1;
     }
 
@@ -123,7 +130,8 @@ int trng_init(void)
 
     delay_cycles(100000);
 
-    if (DL_TRNG_getAnalogHealthTestResults(TRNG) != DL_TRNG_ANALOG_HEALTH_TEST_SUCCESS) {
+    if (DL_TRNG_getAnalogHealthTestResults(TRNG) !=
+            DL_TRNG_ANALOG_HEALTH_TEST_SUCCESS) {
         return -2;
     }
 
@@ -144,7 +152,6 @@ uint32_t trng_read_word(void)
 {
     uint32_t poll_i;
 
-    /* Bounded poll — halt if the peripheral stalls (e.g. after a glitch). */
     for (poll_i = 0; poll_i < TRNG_POLL_LIMIT; poll_i++) {
         if (DL_TRNG_isCaptureReady(TRNG)) break;
     }
@@ -152,8 +159,6 @@ uint32_t trng_read_word(void)
 
     uint32_t value = DL_TRNG_getCapture(TRNG);
     DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CAPTURE_RDY_EVENT);
-
-    /* Trigger the next capture. */
     DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
 
     return value;
@@ -194,31 +199,62 @@ bool secure_compare(const void *a, const void *b, size_t len)
     return (result == 0);
 }
 
+/**
+ * FIX B: HMAC-based PIN comparison.
+ *
+ * Computes HMAC(AUTH_KEY, pin || "pin") and compares with PIN_HMAC.
+ * No raw HSM_PIN is present in this translation unit; the HMAC output
+ * is the only thing an attacker can extract from flash.
+ *
+ * Power-analysis resistance: wolfcrypt's wc_HmacUpdate feeds the six
+ * pin bytes through SHA-256 block compression before any comparison
+ * occurs.  The intermediate SHA-256 state words (a–h) are nonlinear
+ * combinations of the input; there is no single byte that is simply
+ * pin[i] XOR stored[i], removing the direct Hamming-weight oracle.
+ */
+bool check_pin_cmp(const unsigned char *pin)
+{
+    uint8_t computed_mac[HMAC_SIZE];
+    bool    result;
+
+    if (pin == NULL) { return false; }
+
+    /* HMAC(AUTH_KEY, input_pin, "pin") — domain "pin" prevents cross-use. */
+    if (hmac_sha256(AUTH_KEY,
+                    pin, PIN_LENGTH,
+                    HMAC_DOMAIN_PIN,
+                    computed_mac) != 0) {
+        secure_zero(computed_mac, sizeof(computed_mac));
+        return false;
+    }
+
+    /* Constant-time comparison against stored PIN_HMAC. */
+    result = secure_compare(computed_mac, PIN_HMAC, HMAC_SIZE);
+    secure_zero(computed_mac, sizeof(computed_mac));
+
+    return result;
+}
+
+/**
+ * Public check_pin: double-pass check_pin_cmp with random_delay between,
+ * halt if passes disagree, 5-second penalty on wrong PIN.
+ *
+ * Commands that use SECURE_PIN_CHECK + manual delay do not call this
+ * function; it is retained for callers that need a single-call API.
+ */
 bool check_pin(unsigned char *pin)
 {
-    volatile uint8_t result1 = 0;
-    volatile uint8_t result2 = 0;
-    int i, j;
+    volatile bool r1, r2;
 
-    /* First comparison pass. */
-    for (i = 0; i < PIN_LENGTH; i++) {
-        result1 |= pin[i] ^ HSM_PIN[i];
-    }
-
+    r1 = check_pin_cmp(pin);
     random_delay();
+    r2 = check_pin_cmp(pin);
 
-    /* Second comparison pass. */
-    for (j = 0; j < PIN_LENGTH; j++) {
-        result2 |= pin[j] ^ HSM_PIN[j];
-    }
-
-    /* Halt if passes disagree — indicates a glitch attempt. */
-    if (result1 != result2) {
+    if ((bool)r1 != (bool)r2) {
         security_halt();
     }
 
-    /* 5-second delay on wrong PIN to rate-limit brute force. */
-    if (result1 != 0) {
+    if (!r1) {
         delay_ms(5000);
         return false;
     }
@@ -232,12 +268,7 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
     volatile bool found_pass2 = false;
     int i, j;
 
-    /* FIX #7: iterate PERM_COUNT (actual provisioned entries, from secrets.h)
-     * not MAX_PERMS (the full array capacity including zero-padded slots).
-     * Iterating padding entries is a logic error — a corrupt padding entry
-     * with a non-zero group_id would produce a spurious permission grant. */
-
-    /* First pass. */
+    /* First pass — iterate only provisioned entries. */
     for (i = 0; i < PERM_COUNT; i++) {
         bool group_match = (global_permissions[i].group_id == group_id);
         bool has_perm    = false;
@@ -273,8 +304,8 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
         }
     }
 
-    /* Halt if passes disagree. */
-    if (found_pass1 != found_pass2) {
+    /* Passes must agree; disagreement indicates fault injection. */
+    if ((bool)found_pass1 != (bool)found_pass2) {
         security_halt();
     }
 
@@ -326,5 +357,5 @@ bool validate_contents_len(uint16_t len)
 
 bool validate_bool(uint8_t value)
 {
-    return (value == 0 || value == 1);
+    return (value == 0u || value == 1u);
 }
