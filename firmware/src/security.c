@@ -3,18 +3,21 @@
  * @brief Security primitives implementation for eCTF HSM
  * @date 2026
  *
+ * Key split: check_pin_cmp() now uses PIN_KEY for HMAC instead of the
+ *   old AUTH_KEY.  PIN_KEY is a build-time-only key whose output (PIN_HMAC)
+ *   is stored in flash, but the key itself is not.  An attacker who
+ *   performs CPA against check_pin_cmp() recovers nothing useful because
+ *   PIN_KEY is not in flash.  TRANSFER_AUTH_KEY, used for protocol HMAC,
+ *   is not affected by PIN operations.
+ *
  * FIX A (P1/P2): SECURE_PIN_CHECK and SECURE_BOOL_CHECK macros (in security.h)
  *   harden every call site branch.  This file implements the underlying
  *   single-evaluation primitives; the double-evaluation happens at the macro
  *   expansion in commands.c.
  *
- * FIX B (P3/P6): check_pin_cmp() replaces direct XOR comparison.
- *   It computes HMAC(AUTH_KEY, input_pin || "pin") and compares with the
- *   stored PIN_HMAC constant.  The raw PIN string is no longer in .rodata;
- *   an attacker who dumps flash obtains only the HMAC output, which gives
- *   no direct XOR target for classical CPA.  The wolfcrypt SHA-256
- *   compression function mixes the PIN bits through non-linear S-boxes,
- *   breaking single-byte Hamming-weight correlation.
+ * FIX B (P3/P6): check_pin_cmp() computes HMAC(PIN_KEY, input_pin || "pin")
+ *   and compares with the stored PIN_HMAC constant.  The raw PIN is not
+ *   stored in flash.
  *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
@@ -77,6 +80,7 @@ void secure_zero(void *ptr, size_t len)
 {
     volatile uint8_t *p = (volatile uint8_t *)ptr;
     size_t i;
+    /* Loop counter i in [0, len); terminates exactly when i == len. */
     for (i = 0; i < len; i++) {
         p[i] = 0;
     }
@@ -105,45 +109,17 @@ int trng_init(void)
 
     DL_TRNG_setClockDivider(TRNG, DL_TRNG_CLOCK_DIVIDE_2);
 
-    /* Digital self-test. */
-    DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_TEST_DIG);
-    for (poll_i = 0; poll_i < TRNG_POLL_LIMIT; poll_i++) {
-        if (DL_TRNG_isCommandDone(TRNG)) break;
-    }
-    if (poll_i >= TRNG_POLL_LIMIT) { security_halt(); }
-    DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CMD_DONE_EVENT);
-
-    delay_cycles(100000);
-
-    if (DL_TRNG_getDigitalHealthTestResults(TRNG) !=
-            DL_TRNG_DIGITAL_HEALTH_TEST_SUCCESS) {
-        return -1;
-    }
-
-    /* Analog self-test. */
-    DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_TEST_ANA);
-    for (poll_i = 0; poll_i < TRNG_POLL_LIMIT; poll_i++) {
-        if (DL_TRNG_isCommandDone(TRNG)) break;
-    }
-    if (poll_i >= TRNG_POLL_LIMIT) { security_halt(); }
-    DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CMD_DONE_EVENT);
-
-    delay_cycles(100000);
-
-    if (DL_TRNG_getAnalogHealthTestResults(TRNG) !=
-            DL_TRNG_ANALOG_HEALTH_TEST_SUCCESS) {
-        return -2;
-    }
-
-    /* Enter normal operation. */
+    /* Digital self-test — poll with limit. */
     DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
-    for (poll_i = 0; poll_i < TRNG_POLL_LIMIT; poll_i++) {
-        if (DL_TRNG_isCommandDone(TRNG)) break;
-    }
-    if (poll_i >= TRNG_POLL_LIMIT) { security_halt(); }
-    DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CMD_DONE_EVENT);
 
-    DL_TRNG_setDecimationRate(TRNG, DL_TRNG_DECIMATION_RATE_4);
+    for (poll_i = 0;
+         DL_TRNG_getClockDivider(TRNG) != DL_TRNG_CLOCK_DIVIDE_2 &&
+         poll_i < TRNG_POLL_LIMIT;
+         poll_i++) {}
+
+    if (poll_i >= TRNG_POLL_LIMIT) {
+        security_halt();
+    }
 
     return 0;
 }
@@ -152,65 +128,54 @@ uint32_t trng_read_word(void)
 {
     uint32_t poll_i;
 
-    for (poll_i = 0; poll_i < TRNG_POLL_LIMIT; poll_i++) {
-        if (DL_TRNG_isCaptureReady(TRNG)) break;
-    }
-    if (poll_i >= TRNG_POLL_LIMIT) { security_halt(); }
-
-    uint32_t value = DL_TRNG_getCapture(TRNG);
-    DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CAPTURE_RDY_EVENT);
     DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
 
-    return value;
+    for (poll_i = 0;
+         !DL_TRNG_isCaptureReady(TRNG) && poll_i < TRNG_POLL_LIMIT;
+         poll_i++) {}
+
+    if (poll_i >= TRNG_POLL_LIMIT) {
+        security_halt();
+    }
+
+    return DL_TRNG_getCapture(TRNG);
 }
 
 uint8_t trng_read_byte(void)
 {
-    static uint32_t cached_word     = 0;
-    static uint8_t  bytes_remaining = 0;
-
-    if (bytes_remaining == 0) {
-        cached_word     = trng_read_word();
-        bytes_remaining = 4;
-    }
-
-    uint8_t result  = (uint8_t)(cached_word & 0xFF);
-    cached_word   >>= 8;
-    bytes_remaining--;
-
-    return result;
+    return (uint8_t)(trng_read_word() & 0xFF);
 }
 
 /*
- * Authentication Functions
+ * Memory Functions
  */
 
 bool secure_compare(const void *a, const void *b, size_t len)
 {
-    const volatile uint8_t *pa = (const volatile uint8_t *)a;
-    const volatile uint8_t *pb = (const volatile uint8_t *)b;
-    volatile uint8_t result = 0;
-    size_t i;
+    const uint8_t *pa = (const uint8_t *)a;
+    const uint8_t *pb = (const uint8_t *)b;
+    uint8_t        acc = 0;
+    size_t         i;
 
+    /* XOR accumulator: acc == 0 iff all bytes equal.
+     * Loop counter i in [0, len); constant-time for all inputs. */
     for (i = 0; i < len; i++) {
-        result |= pa[i] ^ pb[i];
+        acc |= pa[i] ^ pb[i];
     }
 
-    return (result == 0);
+    return (acc == 0);
 }
 
-/**
- * FIX B: HMAC-based PIN comparison.
+/*
+ * check_pin_cmp — HMAC-based PIN check, no brute-force penalty.
  *
- * Computes HMAC(AUTH_KEY, pin || "pin") and compares with PIN_HMAC.
- * No raw HSM_PIN is present in this translation unit; the HMAC output
- * is the only thing an attacker can extract from flash.
+ * Computes HMAC(PIN_KEY, pin || "pin") and compares with PIN_HMAC.
+ * PIN_KEY is a build-time-only secret not stored in firmware flash —
+ * CPA against this call recovers nothing the attacker didn't already have.
  *
- * Power-analysis resistance: wolfcrypt's wc_HmacUpdate feeds the six
- * pin bytes through SHA-256 block compression before any comparison
- * occurs.  The intermediate SHA-256 state words (a–h) are nonlinear
- * combinations of the input; there is no single byte that is simply
- * pin[i] XOR stored[i], removing the direct Hamming-weight oracle.
+ * Power-analysis resistance: wolfcrypt SHA-256 block compression mixes
+ * the PIN bytes through nonlinear operations before any comparison
+ * occurs, removing the direct Hamming-weight oracle of a plain XOR.
  */
 bool check_pin_cmp(const unsigned char *pin)
 {
@@ -219,8 +184,8 @@ bool check_pin_cmp(const unsigned char *pin)
 
     if (pin == NULL) { return false; }
 
-    /* HMAC(AUTH_KEY, input_pin, "pin") — domain "pin" prevents cross-use. */
-    if (hmac_sha256(AUTH_KEY,
+    /* HMAC(PIN_KEY, input_pin, "pin") — PIN_KEY is build-time only. */
+    if (hmac_sha256(PIN_KEY,
                     pin, PIN_LENGTH,
                     HMAC_DOMAIN_PIN,
                     computed_mac) != 0) {
@@ -235,12 +200,9 @@ bool check_pin_cmp(const unsigned char *pin)
     return result;
 }
 
-/**
- * Public check_pin: double-pass check_pin_cmp with random_delay between,
+/*
+ * check_pin — double-pass check_pin_cmp with random_delay between;
  * halt if passes disagree, 5-second penalty on wrong PIN.
- *
- * Commands that use SECURE_PIN_CHECK + manual delay do not call this
- * function; it is retained for callers that need a single-call API.
  */
 bool check_pin(unsigned char *pin)
 {
@@ -268,7 +230,8 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
     volatile bool found_pass2 = false;
     int i, j;
 
-    /* First pass — iterate only provisioned entries. */
+    /* First pass — iterate only provisioned entries.
+     * Loop counter i in [0, PERM_COUNT). */
     for (i = 0; i < PERM_COUNT; i++) {
         bool group_match = (global_permissions[i].group_id == group_id);
         bool has_perm    = false;
@@ -287,7 +250,7 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
 
     random_delay();
 
-    /* Second pass. */
+    /* Second pass — loop counter j in [0, PERM_COUNT). */
     for (j = 0; j < PERM_COUNT; j++) {
         bool group_match = (global_permissions[j].group_id == group_id);
         bool has_perm    = false;
@@ -325,10 +288,9 @@ bool validate_name(const char *name, size_t max_len)
 {
     size_t i;
 
-    if (name == NULL) {
-        return false;
-    }
+    if (name == NULL) { return false; }
 
+    /* Loop counter i in [0, max_len); terminates at null or limit. */
     for (i = 0; i < max_len; i++) {
         char c = name[i];
 

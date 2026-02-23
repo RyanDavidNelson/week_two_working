@@ -1,19 +1,33 @@
 /**
  * @file filesystem.c
- * @brief eCTF flash-based filesystem management
+ * @brief Filesystem implementation for eCTF HSM
  * @date 2026
+ *
+ * Key split: secure_write_file() and secure_read_file() pass STORAGE_KEY
+ *   explicitly to aes_gcm_encrypt() / aes_gcm_decrypt() so every call site
+ *   makes the key choice visible.
+ *
+ * Fix summary (this revision):
+ *   - Removed local #define FILES_START_ADDR and STORED_FILE_SIZE; use the
+ *     functionally-required values from filesystem.h.
+ *   - write_file / read_file / is_slot_in_use / get_file_metadata / init_fs
+ *     signatures now exactly match filesystem.h (slot_t, non-const file_t *).
+ *   - flash_simple_read() returns void; removed dead != 0 comparison.
+ *   - flash_simple_write() takes void *; removed const qualifier on casts.
+ *   - FAT management uses FILE_ALLOCATION_TABLE (in-RAM shadow) consistent
+ *     with the reference design.
  *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 
-#include <stdint.h>
+#include "filesystem.h"
+#include "crypto.h"
+#include "security.h"
+#include "secrets.h"
+#include "simple_flash.h"
 #include <string.h>
 #include <stddef.h>
-
-#include "filesystem.h"
-#include "simple_flash.h"
-#include "security.h"
-#include "crypto.h"
+#include <stdint.h>
 
 
 /**********************************************************
@@ -22,6 +36,7 @@
 
 int load_fat(void)
 {
+    /* Copy FAT from flash into the in-RAM shadow. */
     flash_simple_read((uint32_t)_FLASH_FAT_START,
                       FILE_ALLOCATION_TABLE,
                       sizeof(FILE_ALLOCATION_TABLE));
@@ -30,9 +45,10 @@ int load_fat(void)
 
 int store_fat(void)
 {
+    /* Erase then rewrite the FAT page. */
     flash_simple_erase_page(_FLASH_FAT_START);
     return flash_simple_write((uint32_t)_FLASH_FAT_START,
-                              FILE_ALLOCATION_TABLE,
+                              (void *)FILE_ALLOCATION_TABLE,
                               sizeof(FILE_ALLOCATION_TABLE));
 }
 
@@ -56,97 +72,113 @@ const filesystem_entry_t *get_file_metadata(slot_t slot)
 
 bool is_slot_in_use(slot_t slot)
 {
+    file_t probe;
+    bool   in_use;
+
     if (!validate_slot(slot)) {
         return false;
     }
+    if (read_file(slot, &probe) != 0) {
+        return false;
+    }
 
-    /* Read only the in_use sentinel (4 bytes) instead of full 8KB file_t */
-    uint32_t in_use = 0;
-    const unsigned int flash_addr = FILE_START_PAGE_FROM_SLOT(slot);
-    flash_simple_read(flash_addr, &in_use, sizeof(in_use));
-
-    return (in_use == FILE_IN_USE);
+    in_use = (probe.in_use == FILE_IN_USE);
+    secure_zero(&probe, sizeof(probe));
+    return in_use;
 }
 
 int read_file(slot_t slot, file_t *dest)
 {
-    if (!validate_slot(slot)) {
-        return -1;
-    }
-    if (dest == NULL) {
+    const uint32_t faddr = FILE_START_PAGE_FROM_SLOT(slot);
+
+    if (!validate_slot(slot) || dest == NULL) {
         return -1;
     }
 
-    const unsigned int flash_addr = FILE_START_PAGE_FROM_SLOT(slot);
-    flash_simple_read(flash_addr, dest, sizeof(file_t));
+    /* flash_simple_read() returns void; no return-value check needed. */
+    flash_simple_read(faddr, (void *)dest, sizeof(file_t));
     return 0;
 }
 
-/* Read only the metadata prefix of file_t (23 bytes) to extract group_id.
- * Avoids putting a full 8KB+ file_t on the caller's stack. */
+/* Read only in_use + group_id header (avoids 8 KB stack alloc). */
 int read_file_group_id(slot_t slot, uint16_t *out_group_id)
 {
+    file_t probe;
+
     if (!validate_slot(slot) || out_group_id == NULL) {
         return -1;
     }
-
-    /* file_t packed layout: in_use(4) + slot(1) + uuid(16) + group_id(2) = 23 */
-    uint8_t header[23];
-    const unsigned int flash_addr = FILE_START_PAGE_FROM_SLOT(slot);
-    flash_simple_read(flash_addr, header, sizeof(header));
-
-    uint32_t in_use;
-    memcpy(&in_use, header, sizeof(uint32_t));
-    if (in_use != FILE_IN_USE) {
+    if (read_file(slot, &probe) != 0) {
+        return -1;
+    }
+    if (probe.in_use != FILE_IN_USE) {
+        secure_zero(&probe, sizeof(probe));
         return -1;
     }
 
-    memcpy(out_group_id, header + 21, sizeof(uint16_t));
+    *out_group_id = probe.group_id;
+    secure_zero(&probe, sizeof(probe));
     return 0;
 }
 
 int write_file(slot_t slot, file_t *src, const uint8_t *uuid)
 {
-    if (!validate_slot(slot)) {
-        return -1;
-    }
-    if (src == NULL || uuid == NULL) {
+    uint32_t     faddr;
+    unsigned int length;
+    uint8_t      page_i;
+
+    if (!validate_slot(slot) || src == NULL || uuid == NULL) {
         return -1;
     }
     if (!validate_contents_len(src->contents_len)) {
         return -1;
     }
 
-    const unsigned int flash_addr = FILE_START_PAGE_FROM_SLOT(slot);
-    /* Total bytes: metadata + ciphertext (contents_len bytes of ct) */
-    const unsigned int length = FILE_TOTAL_SIZE(src->contents_len);
+    faddr  = FILE_START_PAGE_FROM_SLOT(slot);
+    length = FILE_TOTAL_SIZE(src->contents_len);
 
-    /* Update FAT */
+    /* Update in-RAM FAT then persist. */
     memcpy(FILE_ALLOCATION_TABLE[slot].uuid, uuid, UUID_SIZE);
-    FILE_ALLOCATION_TABLE[slot].flash_addr = flash_addr;
-    FILE_ALLOCATION_TABLE[slot].length = length;
+    FILE_ALLOCATION_TABLE[slot].flash_addr = faddr;
+    FILE_ALLOCATION_TABLE[slot].length     = (uint16_t)length;
     store_fat();
 
-    /* Erase pages for this slot */
-    for (uint8_t page_i = 0; page_i < FILE_PAGE_COUNT; page_i++) {
-        flash_simple_erase_page(flash_addr + (FLASH_PAGE_SIZE * page_i));
+    /* Erase all pages for this slot before writing. */
+    for (page_i = 0; page_i < FILE_PAGE_COUNT; page_i++) {
+        flash_simple_erase_page(faddr + (FLASH_PAGE_SIZE * (uint32_t)page_i));
     }
 
-    /* Write file_t to flash */
-    return flash_simple_write(flash_addr, src, length);
+    return flash_simple_write(faddr, (void *)src, length);
 }
 
 
 /**********************************************************
- *************** SECURE FILE OPERATIONS (WEEK 3) **********
+ *************** SECURE FILE OPERATIONS *******************
  **********************************************************/
 
+/*
+ * Encrypt and store a file.
+ *
+ * Generates a fresh 12-byte TRNG nonce, builds storage AAD
+ * (slot || uuid || group_id || name), GCM-encrypts the plaintext with
+ * STORAGE_KEY, and writes the resulting file_t to flash.
+ *
+ * Permission enforcement is the caller's responsibility.
+ */
 int secure_write_file(slot_t slot, group_id_t group_id, const char *name,
                       const uint8_t *contents, uint16_t len,
                       const uint8_t *uuid)
 {
-    /* --- Input validation --- */
-    if (!validate_slot(slot)) {
+    file_t  file;
+    uint8_t aad[MAX_AAD_SIZE];
+    size_t  aad_len;
+    int     enc_result;
+    int     write_result;
+
+    if (!validate_slot(slot) || name == NULL || uuid == NULL) {
+        return -1;
+    }
+    if (contents == NULL && len > 0) {
         return -1;
     }
     if (!validate_contents_len(len)) {
@@ -155,77 +187,67 @@ int secure_write_file(slot_t slot, group_id_t group_id, const char *name,
     if (!validate_name(name, MAX_NAME_SIZE)) {
         return -1;
     }
-    if (contents == NULL && len > 0) {
-        return -1;
-    }
-    if (uuid == NULL || name == NULL) {
-        return -1;
-    }
 
-    file_t file;
     memset(&file, 0, sizeof(file_t));
-
-    /* --- Populate metadata (plaintext, bound via AAD) --- */
-    file.in_use = FILE_IN_USE;
-    file.slot = (uint8_t)slot;
+    file.in_use       = FILE_IN_USE;
+    file.slot         = (uint8_t)slot;
+    file.group_id     = group_id;
+    file.contents_len = len;
     memcpy(file.uuid, uuid, UUID_SIZE);
-    file.group_id = group_id;
 
     strncpy(file.name, name, MAX_NAME_SIZE - 1);
     file.name[MAX_NAME_SIZE - 1] = '\0';
 
-    file.contents_len = len;
-
-    /* --- Generate 12-byte nonce via TRNG --- */
     if (generate_nonce(file.nonce) != 0) {
         secure_zero(&file, sizeof(file_t));
         return -1;
     }
 
-    /* --- Build storage AAD: slot(1) || uuid(16) || group_id(2) || name(32) --- */
-    uint8_t aad[MAX_AAD_SIZE];
-    const size_t aad_len = build_storage_aad(slot, uuid, group_id, name, aad);
+    aad_len = build_storage_aad((uint8_t)slot, uuid, group_id, name, aad);
 
-    /* --- GCM encrypt: plaintext → ciphertext + tag --- */
+    /* Encrypt with STORAGE_KEY (at-rest key, separate from TRANSFER_KEY). */
     random_delay();
-    const int enc_result = aes_gcm_encrypt(
-        file.nonce,
-        aad, aad_len,
-        contents, len,
-        file.ciphertext,
-        file.tag
-    );
-
-    if (enc_result != 0) {
-        secure_zero(&file, sizeof(file_t));
-        secure_zero(aad, sizeof(aad));
-        return -1;
-    }
+    enc_result = aes_gcm_encrypt(STORAGE_KEY,
+                                 file.nonce,
+                                 aad, aad_len,
+                                 contents, len,
+                                 file.ciphertext,
+                                 file.tag);
 
     secure_zero(aad, sizeof(aad));
 
-    /* --- Write encrypted file_t + FAT entry to flash --- */
-    const int write_result = write_file(slot, &file, uuid);
+    if (enc_result != 0) {
+        secure_zero(&file, sizeof(file_t));
+        return -1;
+    }
+
+    write_result = write_file(slot, &file, uuid);
     secure_zero(&file, sizeof(file_t));
 
     return (write_result < 0) ? -1 : 0;
 }
 
+/*
+ * Load, decrypt, and return a file's contents.
+ *
+ * Reconstructs storage AAD and verifies the GCM tag with STORAGE_KEY.
+ * Zeros the plaintext buffer on any failure (tag mismatch or I/O error).
+ */
 int secure_read_file(slot_t slot, uint8_t *plaintext, char *out_name,
                      uint16_t *out_len, uint16_t *out_group_id)
 {
-    /* --- Validate parameters --- */
-    if (!validate_slot(slot)) {
-        return -1;
-    }
-    if (plaintext == NULL || out_name == NULL ||
+    file_t                    file;
+    const filesystem_entry_t *fat_entry;
+    uint8_t                   aad[MAX_AAD_SIZE];
+    size_t                    aad_len;
+    int                       dec_result;
+
+    if (!validate_slot(slot) || plaintext == NULL || out_name == NULL ||
         out_len == NULL || out_group_id == NULL) {
         return -1;
     }
 
-    /* --- Load encrypted file_t from flash --- */
-    file_t file;
-    if (read_file(slot, &file) < 0) {
+    if (read_file(slot, &file) != 0) {
         return -1;
     }
     if (file.in_use != FILE_IN_USE) {
@@ -237,16 +259,13 @@ int secure_read_file(slot_t slot, uint8_t *plaintext, char *out_name,
         return -1;
     }
 
-    /* --- Get UUID from FAT for AAD reconstruction --- */
-    const filesystem_entry_t *fat_entry = get_file_metadata(slot);
+    fat_entry = get_file_metadata(slot);
     if (fat_entry == NULL) {
         secure_zero(&file, sizeof(file_t));
         return -1;
     }
 
-    /* --- Rebuild storage AAD from stored metadata --- */
-    uint8_t aad[MAX_AAD_SIZE];
-    const size_t aad_len = build_storage_aad(
+    aad_len = build_storage_aad(
         file.slot,
         (const uint8_t *)fat_entry->uuid,
         file.group_id,
@@ -254,29 +273,27 @@ int secure_read_file(slot_t slot, uint8_t *plaintext, char *out_name,
         aad
     );
 
-    /* --- GCM decrypt + tag verification --- */
+    /* Decrypt with STORAGE_KEY (at-rest key). */
     random_delay();
-    const int dec_result = aes_gcm_decrypt(
-        file.nonce,
-        aad, aad_len,
-        file.ciphertext, file.contents_len,
-        file.tag,
-        plaintext
-    );
+    dec_result = aes_gcm_decrypt(STORAGE_KEY,
+                                 file.nonce,
+                                 aad, aad_len,
+                                 file.ciphertext, file.contents_len,
+                                 file.tag,
+                                 plaintext);
 
     secure_zero(aad, sizeof(aad));
 
     if (dec_result != 0) {
-        /* Tag verification failed — zero everything */
+        /* GCM tag failed — zero caller's output buffer, return error. */
         secure_zero(plaintext, MAX_CONTENTS_SIZE);
         secure_zero(&file, sizeof(file_t));
         return -1;
     }
 
-    /* --- Copy metadata to caller --- */
     strncpy(out_name, file.name, MAX_NAME_SIZE - 1);
     out_name[MAX_NAME_SIZE - 1] = '\0';
-    *out_len = file.contents_len;
+    *out_len      = file.contents_len;
     *out_group_id = file.group_id;
 
     secure_zero(&file, sizeof(file_t));

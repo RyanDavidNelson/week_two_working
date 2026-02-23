@@ -3,15 +3,14 @@
  * @brief Cryptographic API for eCTF HSM
  * @date 2026
  *
- * FIX C (P5): build_transfer_aad() now accepts a name parameter and
- *   appends a zero-padded 32-byte name field to the transfer AAD.
- *   New transfer AAD layout:
- *     recv_chal(12) || send_chal(12) || slot(1) || uuid(16) ||
- *     group_id(2 LE) || name(32 zero-padded) = 75 bytes.
- *   This binds the filename to the GCM tag for the transfer ciphertext,
- *   preventing a MITM on UART1 from renaming a file in flight without
- *   breaking authentication.
- *   TRANSFER_AAD_SIZE and MAX_AAD_SIZE updated accordingly.
+ * Key split: aes_gcm_encrypt() and aes_gcm_decrypt() now accept an
+ *   explicit key parameter instead of implicitly reaching for GCM_KEY.
+ *   Call sites pass STORAGE_KEY (files at rest) or TRANSFER_KEY (transit).
+ *   hmac_sha256() and hmac_verify() already accepted a key parameter —
+ *   no change to their signatures.
+ *
+ * FIX C (P5): build_transfer_aad() accepts a name parameter and appends
+ *   a zero-padded 32-byte name field.  Transfer AAD = 75 bytes.
  *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
@@ -59,8 +58,12 @@
 int crypto_init(void);
 
 /**
- * @brief AES-256-GCM encrypt.  Key loaded from flash per call.
+ * @brief AES-256-GCM encrypt.  Key loaded from caller-supplied pointer per call.
  *
+ * Pass STORAGE_KEY for files at rest, TRANSFER_KEY for files in transit.
+ * Key must be 32 bytes and 4-byte aligned (AESADV requirement).
+ *
+ * @param key         32-byte AES-256 key (4-byte aligned).
  * @param nonce       12-byte IV (from TRNG).
  * @param aad         Additional authenticated data (not encrypted).
  * @param aad_len     Length of AAD.
@@ -70,7 +73,8 @@ int crypto_init(void);
  * @param tag         Output 16-byte authentication tag.
  * @return 0 on success, -1 on error.
  */
-int aes_gcm_encrypt(const uint8_t *nonce,
+int aes_gcm_encrypt(const uint8_t *key,
+                    const uint8_t *nonce,
                     const uint8_t *aad, size_t aad_len,
                     const uint8_t *plaintext, size_t pt_len,
                     uint8_t *ciphertext,
@@ -79,6 +83,9 @@ int aes_gcm_encrypt(const uint8_t *nonce,
 /**
  * @brief AES-256-GCM decrypt.  Plaintext zeroed on tag failure or any error.
  *
+ * Pass STORAGE_KEY for files at rest, TRANSFER_KEY for files in transit.
+ *
+ * @param key         32-byte AES-256 key (4-byte aligned).
  * @param nonce       12-byte IV stored with the file.
  * @param aad         Additional authenticated data.
  * @param aad_len     Length of AAD.
@@ -88,7 +95,8 @@ int aes_gcm_encrypt(const uint8_t *nonce,
  * @param plaintext   Output plaintext buffer (zeroed on failure).
  * @return 0 on success, -1 on failure (tag mismatch or error).
  */
-int aes_gcm_decrypt(const uint8_t *nonce,
+int aes_gcm_decrypt(const uint8_t *key,
+                    const uint8_t *nonce,
                     const uint8_t *aad, size_t aad_len,
                     const uint8_t *ciphertext, size_t ct_len,
                     const uint8_t *tag,
@@ -156,24 +164,21 @@ size_t build_storage_aad(uint8_t slot,
  *        Format: recv_chal(12) || send_chal(12) || slot(1) || uuid(16) ||
  *                group_id(2 LE) || name(32 zero-padded).
  *
- *  The name field was added (FIX C) to bind the filename to the GCM tag,
- *  preventing in-flight renaming by a MITM on the transfer interface.
- *
- * @param receiver_challenge  12-byte challenge from receiver.
- * @param sender_challenge    12-byte challenge from sender.
- * @param slot                Requested slot index.
- * @param uuid                16-byte file UUID.
- * @param group_id            Permission group ID.
- * @param name                Null-terminated filename (may be NULL).
- * @param aad                 Output buffer (at least TRANSFER_AAD_SIZE bytes).
+ * @param recv_chal  12-byte receiver challenge.
+ * @param send_chal  12-byte sender challenge.
+ * @param slot       Requested slot index.
+ * @param uuid       16-byte file UUID.
+ * @param group_id   Permission group ID.
+ * @param name       Null-terminated filename.
+ * @param aad        Output buffer (at least TRANSFER_AAD_SIZE bytes).
  * @return Bytes written (75).
  */
-size_t build_transfer_aad(const uint8_t *receiver_challenge,
-                          const uint8_t *sender_challenge,
-                          uint8_t slot,
-                          const uint8_t *uuid,
-                          uint16_t group_id,
-                          const char *name,
-                          uint8_t *aad);
+size_t build_transfer_aad(const uint8_t *recv_chal,
+                           const uint8_t *send_chal,
+                           uint8_t slot,
+                           const uint8_t *uuid,
+                           uint16_t group_id,
+                           const char *name,
+                           uint8_t *aad);
 
-#endif /* __CRYPTO_H__ */
+#endif  /* __CRYPTO_H__ */

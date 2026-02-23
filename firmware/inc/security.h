@@ -3,21 +3,14 @@
  * @brief Security primitives for eCTF HSM
  * @date 2026
  *
- * Changes from previous version:
- *
  *  FIX A (P1/P2) — SECURE_PIN_CHECK / SECURE_BOOL_CHECK macros.
- *    Every security-critical boolean branch at each call site is now
- *    evaluated twice with a random_delay() between passes.  If the two
- *    evaluations disagree (indicating a fault injection mid-check),
- *    security_halt() is called.  This turns a single-glitch bypass into
- *    a required double-glitch with a halt window between them.
+ *    Every security-critical boolean branch is evaluated twice with a
+ *    random_delay() between passes.  Disagreement → security_halt().
+ *    Turns a single-glitch bypass into a required double-glitch.
  *
  *  FIX B (P3/P6) — HMAC-based PIN verification.
- *    check_pin_cmp() computes HMAC(AUTH_KEY, input_pin || "pin") and
- *    compares with the stored PIN_HMAC constant.  The raw PIN value is
- *    never stored in .rodata and never XOR'd directly with attacker-
- *    controlled input, breaking classical CPA on the comparison bytes.
- *    check_pin() wraps check_pin_cmp() with the 5-second penalty.
+ *    check_pin_cmp() computes HMAC(PIN_KEY, input_pin || "pin") and
+ *    compares with PIN_HMAC.  Raw PIN never stored in .rodata.
  *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
@@ -28,9 +21,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define MAX_PERMS   8
-#define PIN_LENGTH  6
-#define CYCLES_PER_MS 32000
+#define MAX_PERMS      8
+#define PIN_LENGTH     6
+#define CYCLES_PER_MS  32000
 
 typedef enum {
     PERM_READ    = 'R',
@@ -45,22 +38,18 @@ typedef struct {
     bool receive;
 } group_permission_t;
 
-/* HMAC domain separator for PIN verification (FIX B). */
-#define HMAC_DOMAIN_PIN "pin"
-
 /**
  * @defgroup SecureBranchMacros  Double-evaluation glitch-hardened branch macros
  *
- * Pattern: evaluate the condition twice, halt if results disagree.
  * Callers declare ok1 and ok2 as `volatile bool`.
  * @{
  */
 
 /**
  * SECURE_PIN_CHECK — double-evaluate check_pin_cmp(), halt on mismatch.
- * pin_ptr must remain valid (not zeroed) for both evaluations.
- * The caller is responsible for zeroing pin_ptr and adding the 5-second
- * penalty after this macro.
+ * pin_ptr must remain valid for both evaluations.
+ * Caller is responsible for zeroing pin_ptr and applying the 5-second
+ * penalty on failure after this macro.
  */
 #define SECURE_PIN_CHECK(ok1, ok2, pin_ptr)        \
     do {                                            \
@@ -74,7 +63,7 @@ typedef struct {
 
 /**
  * SECURE_BOOL_CHECK — double-evaluate any boolean expression, halt on mismatch.
- * expr must be side-effect-free (it is evaluated twice).
+ * expr must be side-effect-free (evaluated twice).
  */
 #define SECURE_BOOL_CHECK(ok1, ok2, expr)          \
     do {                                            \
@@ -92,22 +81,22 @@ typedef struct {
  * Timing Functions
  */
 
-void delay_cycles(uint32_t cycles);
-void delay_ms(uint32_t ms);
-void random_delay(void);
+void     delay_cycles(uint32_t cycles);
+void     delay_ms(uint32_t ms);
+void     random_delay(void);
 
 /*
  * Memory Functions
  */
 
-void secure_zero(void *ptr, size_t len);
-void security_halt(void) __attribute__((noreturn));
+void     secure_zero(void *ptr, size_t len);
+void     security_halt(void) __attribute__((noreturn));
 
 /*
  * Hardware TRNG Functions
  */
 
-int     trng_init(void);
+int      trng_init(void);
 uint32_t trng_read_word(void);
 uint8_t  trng_read_byte(void);
 
@@ -115,14 +104,14 @@ uint8_t  trng_read_byte(void);
  * Authentication Functions
  */
 
-/** Constant-time byte-wise comparison. */
+/** Constant-time byte-wise comparison (no early exit). */
 bool secure_compare(const void *a, const void *b, size_t len);
 
 /**
- * @brief Compare pin to stored PIN_HMAC using HMAC(AUTH_KEY, pin || "pin").
+ * @brief Compare pin to PIN_HMAC using HMAC(PIN_KEY, pin || "pin").
  *        No 5-second penalty.  Use SECURE_PIN_CHECK macro at call sites.
  *
- * @param pin  6-byte input PIN (hex ASCII, not null-terminated required).
+ * @param pin  PIN_LENGTH-byte input PIN (hex ASCII).
  * @return true if pin matches, false otherwise.
  */
 bool check_pin_cmp(const unsigned char *pin);
@@ -132,7 +121,7 @@ bool check_pin_cmp(const unsigned char *pin);
  *        Internally calls check_pin_cmp() twice with random_delay between;
  *        halts if passes disagree.
  *
- * @param pin  6-byte input PIN.
+ * @param pin  PIN_LENGTH-byte input PIN.
  * @return true if correct, false (after 5s delay) if wrong.
  */
 bool check_pin(unsigned char *pin);
