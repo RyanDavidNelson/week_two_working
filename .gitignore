@@ -338,3 +338,9 @@ wolfssl/
 *.secrets.txt
 **/secrets.h
 uv.lock
+
+# generated secrets
+firmware/src/secrets.c
+global.secrets
+ectf26_design/src/__pycache__/
+*.pyc
