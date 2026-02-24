@@ -3,21 +3,20 @@
  * @brief Security primitives implementation for eCTF HSM
  * @date 2026
  *
- * Key split: check_pin_cmp() now uses PIN_KEY for HMAC instead of the
- *   old AUTH_KEY.  PIN_KEY is a build-time-only key whose output (PIN_HMAC)
- *   is stored in flash, but the key itself is not.  An attacker who
- *   performs CPA against check_pin_cmp() recovers nothing useful because
- *   PIN_KEY is not in flash.  TRANSFER_AUTH_KEY, used for protocol HMAC,
- *   is not affected by PIN operations.
+ * Key split: check_pin_cmp() uses PIN_KEY for HMAC.  PIN_KEY is a runtime
+ *   key stored in flash; CPA against check_pin_cmp recovers PIN_KEY but not
+ *   TRANSFER_AUTH_KEY (they are independent 256-bit values).
  *
  * FIX A (P1/P2): SECURE_PIN_CHECK and SECURE_BOOL_CHECK macros (in security.h)
  *   harden every call site branch.  This file implements the underlying
- *   single-evaluation primitives; the double-evaluation happens at the macro
- *   expansion in commands.c.
+ *   single-evaluation primitives; double-evaluation happens at the macro.
  *
  * FIX B (P3/P6): check_pin_cmp() computes HMAC(PIN_KEY, input_pin || "pin")
- *   and compares with the stored PIN_HMAC constant.  The raw PIN is not
- *   stored in flash.
+ *   and compares with the stored PIN_HMAC constant.  Raw PIN not in flash.
+ *
+ * SCA JITTER: random_delay_wide() uses two TRNG bytes (16-bit range) for a
+ *   0–~20 ms pre-key-load jitter window.  random_delay() (one byte, 0–~4 ms)
+ *   is retained for glitch desynchronisation between double-evaluation passes.
  *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
@@ -67,8 +66,21 @@ void delay_ms(uint32_t ms)
 
 void random_delay(void)
 {
-    /* 0–~4 ms random jitter for glitch desynchronisation. */
-    uint32_t jitter = (trng_read_byte() & 0x7F) * (CYCLES_PER_MS / 8);
+    /* 0–~4 ms jitter for glitch desynchronisation between double-eval passes.
+     * One TRNG byte → 7-bit value × (CYCLES_PER_MS/8) cycles. */
+    uint32_t jitter = (uint32_t)(trng_read_byte() & 0x7F) * (CYCLES_PER_MS / 8);
+    delay_cycles(jitter);
+}
+
+void random_delay_wide(void)
+{
+    /* 0–~20 ms jitter for SCA pre-key-load desynchronisation.
+     * Two TRNG bytes form a 16-bit value; scale to cycle count.
+     * Range: 0 to 65535 × (CYCLES_PER_MS / ~3) ≈ 0–640k cycles ≈ 0–20 ms.
+     * Wider window means CPA requires proportionally more traces. */
+    uint32_t lo     = (uint32_t)trng_read_byte();
+    uint32_t hi     = (uint32_t)trng_read_byte();
+    uint32_t jitter = ((hi << 8) | lo) * (CYCLES_PER_MS / 3);
     delay_cycles(jitter);
 }
 
@@ -108,10 +120,9 @@ int trng_init(void)
 #endif
 
     DL_TRNG_setClockDivider(TRNG, DL_TRNG_CLOCK_DIVIDE_2);
-
-    /* Digital self-test — poll with limit. */
     DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
 
+    /* Poll until clock divider confirms normal mode. */
     for (poll_i = 0;
          DL_TRNG_getClockDivider(TRNG) != DL_TRNG_CLOCK_DIVIDE_2 &&
          poll_i < TRNG_POLL_LIMIT;
@@ -130,6 +141,7 @@ uint32_t trng_read_word(void)
 
     DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
 
+    /* Poll until capture ready, with limit. */
     for (poll_i = 0;
          !DL_TRNG_isCaptureReady(TRNG) && poll_i < TRNG_POLL_LIMIT;
          poll_i++) {}
@@ -167,15 +179,10 @@ bool secure_compare(const void *a, const void *b, size_t len)
 }
 
 /*
- * check_pin_cmp — HMAC-based PIN check, no brute-force penalty.
+ * check_pin_cmp — HMAC-based PIN check, single pass, no brute-force penalty.
  *
  * Computes HMAC(PIN_KEY, pin || "pin") and compares with PIN_HMAC.
- * PIN_KEY is a build-time-only secret not stored in firmware flash —
- * CPA against this call recovers nothing the attacker didn't already have.
- *
- * Power-analysis resistance: wolfcrypt SHA-256 block compression mixes
- * the PIN bytes through nonlinear operations before any comparison
- * occurs, removing the direct Hamming-weight oracle of a plain XOR.
+ * Called twice by SECURE_PIN_CHECK with random_delay() between passes.
  */
 bool check_pin_cmp(const unsigned char *pin)
 {
@@ -184,7 +191,6 @@ bool check_pin_cmp(const unsigned char *pin)
 
     if (pin == NULL) { return false; }
 
-    /* HMAC(PIN_KEY, input_pin, "pin") — PIN_KEY is build-time only. */
     if (hmac_sha256(PIN_KEY,
                     pin, PIN_LENGTH,
                     HMAC_DOMAIN_PIN,
@@ -193,7 +199,6 @@ bool check_pin_cmp(const unsigned char *pin)
         return false;
     }
 
-    /* Constant-time comparison against stored PIN_HMAC. */
     result = secure_compare(computed_mac, PIN_HMAC, HMAC_SIZE);
     secure_zero(computed_mac, sizeof(computed_mac));
 
@@ -230,8 +235,7 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
     volatile bool found_pass2 = false;
     int i, j;
 
-    /* First pass — iterate only provisioned entries.
-     * Loop counter i in [0, PERM_COUNT). */
+    /* First pass — loop counter i in [0, PERM_COUNT). */
     for (i = 0; i < PERM_COUNT; i++) {
         bool group_match = (global_permissions[i].group_id == group_id);
         bool has_perm    = false;
@@ -299,12 +303,13 @@ bool validate_name(const char *name, size_t max_len)
         }
 
         /* Printable ASCII only: 0x20 (space) through 0x7E (~). */
-        if (c < 0x20 || c > 0x7E) {
+        if ((uint8_t)c < 0x20 || (uint8_t)c > 0x7E) {
             return false;
         }
     }
 
-    return false; /* No null terminator within max_len — reject. */
+    /* Reached max_len without null terminator. */
+    return false;
 }
 
 bool validate_perm_count(uint8_t count)

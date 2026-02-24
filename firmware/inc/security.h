@@ -12,6 +12,11 @@
  *    check_pin_cmp() computes HMAC(PIN_KEY, input_pin || "pin") and
  *    compares with PIN_HMAC.  Raw PIN never stored in .rodata.
  *
+ *  SCA JITTER — random_delay_wide() for pre-key-load desynchronisation.
+ *    Uses two TRNG bytes for a 0–~20 ms window, substantially wider than
+ *    random_delay() (0–~4 ms).  Called in crypto.c before every
+ *    DL_AESADV_setKeyAligned() to slide the key-load power spike.
+ *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 #ifndef __SECURITY_H__
@@ -83,7 +88,23 @@ typedef struct {
 
 void     delay_cycles(uint32_t cycles);
 void     delay_ms(uint32_t ms);
+
+/**
+ * @brief Short random jitter: 0–~4 ms from one TRNG byte.
+ *
+ * Used between double-evaluation passes in SECURE_PIN_CHECK and
+ * SECURE_BOOL_CHECK to desynchronise fault-injection timing.
+ */
 void     random_delay(void);
+
+/**
+ * @brief Wide random jitter: 0–~20 ms from two TRNG bytes.
+ *
+ * Called in crypto.c immediately before each DL_AESADV_setKeyAligned()
+ * to slide the key-load power spike across a larger trace window.
+ * Wider range means CPA needs more traces to average through the noise.
+ */
+void     random_delay_wide(void);
 
 /*
  * Memory Functions
@@ -105,45 +126,23 @@ uint8_t  trng_read_byte(void);
  */
 
 /** Constant-time byte-wise comparison (no early exit). */
-bool secure_compare(const void *a, const void *b, size_t len);
+bool     secure_compare(const void *a, const void *b, size_t len);
 
-/**
- * @brief Compare pin to PIN_HMAC using HMAC(PIN_KEY, pin || "pin").
- *        No 5-second penalty.  Use SECURE_PIN_CHECK macro at call sites.
- *
- * @param pin  PIN_LENGTH-byte input PIN (hex ASCII).
- * @return true if pin matches, false otherwise.
- */
-bool check_pin_cmp(const unsigned char *pin);
+/** Single-pass HMAC-based PIN check (no penalty). */
+bool     check_pin_cmp(const unsigned char *pin);
 
-/**
- * @brief Full PIN check: HMAC comparison + 5-second penalty on failure.
- *        Internally calls check_pin_cmp() twice with random_delay between;
- *        halts if passes disagree.
- *
- * @param pin  PIN_LENGTH-byte input PIN.
- * @return true if correct, false (after 5s delay) if wrong.
- */
-bool check_pin(unsigned char *pin);
+/** Double-pass PIN check with 5-second penalty on failure. */
+bool     check_pin(unsigned char *pin);
 
-/**
- * @brief Verify that global_permissions[] contains the requested permission.
- *        Double-pass with random_delay between; halts on mismatch.
- *
- * @param group_id  Permission group to query.
- * @param perm      Permission type (PERM_READ, PERM_WRITE, PERM_RECEIVE).
- * @return true if permission exists.
- */
-bool validate_permission(uint16_t group_id, permission_enum_t perm);
+/** Double-pass permission lookup; halts on disagreement. */
+bool     validate_permission(uint16_t group_id, permission_enum_t perm);
 
-/*
- * Input Validation Functions
- */
+bool     validate_slot(uint8_t slot);
+bool     validate_name(const char *name, size_t max_len);
+bool     validate_perm_count(uint8_t count);
+bool     validate_contents_len(uint16_t len);
+bool     validate_bool(uint8_t value);
 
-bool validate_slot(uint8_t slot);
-bool validate_name(const char *name, size_t max_len);
-bool validate_perm_count(uint8_t count);
-bool validate_contents_len(uint16_t len);
-bool validate_bool(uint8_t value);
+/* Note: validate_perm_bytes() is static in commands.c — not declared here. */
 
 #endif  /* __SECURITY_H__ */

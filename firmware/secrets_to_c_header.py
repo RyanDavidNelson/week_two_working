@@ -9,21 +9,29 @@ Key split (from gen_secrets.py):
 
   STORAGE_KEY (32 B)       — Runtime.  AES-256-GCM for files at rest.
   TRANSFER_KEY (32 B)      — Runtime.  AES-256-GCM for files in transit.
-  TRANSFER_AUTH_KEY (32 B) — Runtime.  HMAC for protocol auth (sender/
-                             receiver/interrogate/permission MAC verify).
+  TRANSFER_AUTH_KEY (32 B) — Runtime.  HMAC for protocol auth (sender_auth,
+                             receiver_auth, interrogate) AND for computing and
+                             verifying PERMISSION_MAC.
   PIN_KEY (32 B)           — Runtime.  HMAC for PIN verification.
-                             Separate from TRANSFER_AUTH_KEY so CPA on
-                             PIN check does not expose the protocol key.
-  PERM_KEY (32 B)          — Build-time only.  Used here to compute
-                             PERMISSION_MAC; NOT emitted to secrets.h/c.
+                             Separate from TRANSFER_AUTH_KEY so a CPA attack
+                             on the PIN check does not expose the protocol key.
+
+Why PERM_KEY was removed:
+  A MAC is only verifiable by a party that holds the same key used to
+  produce it.  The responder HSM verifies PERMISSION_MAC at runtime using
+  TRANSFER_AUTH_KEY (the only shared HMAC key in firmware).  Computing the
+  MAC with a different build-time-only key (PERM_KEY) means verification
+  always fails — the build-time and runtime keys are independent 256-bit
+  values.  The correct design is: compute PERMISSION_MAC with
+  TRANSFER_AUTH_KEY at build time so the runtime verifier can succeed.
 
 Precomputed values written to firmware:
-  PERMISSION_MAC = HMAC(PERM_KEY,  perm_count || permissions || "permission")
-  PIN_HMAC       = HMAC(PIN_KEY,   pin_bytes   || "pin")
+  PERMISSION_MAC = HMAC(TRANSFER_AUTH_KEY, perm_count || permissions || "permission")
+  PIN_HMAC       = HMAC(PIN_KEY,           pin_bytes   || "pin")
 
-Earlier fixes retained:
-  FIX B (P3/P6): PIN_HMAC replaces raw HSM_PIN.
-  FIX D (P4):    extern in .h, definitions in .c — no per-TU duplication.
+Retained fixes:
+  FIX B (P3/P6): PIN_HMAC replaces raw HSM_PIN in flash.
+  FIX D (P4):    extern declarations in .h, definitions only in .c.
 
 Usage:
     python3 secrets_to_c_header.py <secrets_json> <hsm_pin> <permissions> [--out-dir DIR]
@@ -116,18 +124,26 @@ def compute_hmac(key: bytes, data: bytes, domain: bytes) -> bytes:
     return hmac_mod.new(key, data + domain, hashlib.sha256).digest()
 
 
-def compute_permission_mac(perm_key: bytes, permissions: PermissionList) -> bytes:
-    """HMAC(PERM_KEY, perm_count || permissions || 'permission').
-    PERM_KEY is build-time only and not emitted to firmware.
+def compute_permission_mac(transfer_auth_key: bytes, permissions: PermissionList) -> bytes:
+    """HMAC(TRANSFER_AUTH_KEY, perm_count || permissions || 'permission').
+
+    TRANSFER_AUTH_KEY is the shared runtime HMAC key present in every
+    deployment HSM.  Using it here ensures the responder's verify_perm_mac()
+    — which also uses TRANSFER_AUTH_KEY — can successfully verify the MAC.
+
+    A build-time-only key (the former PERM_KEY) cannot work here because the
+    responder has no way to recompute the MAC at runtime without it.
     """
     perm_count = len(permissions)
     data = struct.pack('B', perm_count) + permissions.to_bytes()
-    return compute_hmac(perm_key, data, b'permission')
+    return compute_hmac(transfer_auth_key, data, b'permission')
 
 
 def compute_pin_hmac(pin_key: bytes, hsm_pin: str) -> bytes:
     """HMAC(PIN_KEY, pin_bytes || 'pin').
+
     pin_bytes is the raw ASCII of the 6-character hex PIN string.
+    FIX B: replaces storing the raw PIN in flash.
     """
     pin_bytes = hsm_pin.encode('ascii')
     return compute_hmac(pin_key, pin_bytes, b'pin')
@@ -160,21 +176,26 @@ def secrets_to_c_header(
     hsm_pin: str,
     secrets: bytes,
 ):
-    """Generate secrets.h and secrets.c from deployment secrets JSON."""
+    """Generate secrets.h and secrets.c from deployment secrets JSON.
+
+    PERMISSION_MAC is computed with TRANSFER_AUTH_KEY (not a separate
+    build-time key) so that the runtime verifier can successfully verify it.
+    """
     raw = json.loads(secrets.decode())
 
     storage_key       = bytes.fromhex(raw['storage_key'])
     transfer_key      = bytes.fromhex(raw['transfer_key'])
     transfer_auth_key = bytes.fromhex(raw['transfer_auth_key'])
-    perm_key          = bytes.fromhex(raw['perm_key'])    # build-time only, not emitted
-    pin_key           = bytes.fromhex(raw['pin_key'])     # runtime key, emitted
+    pin_key           = bytes.fromhex(raw['pin_key'])
 
     perm_count     = len(permissions)
-    permission_mac = compute_permission_mac(perm_key, permissions)
+    # PERMISSION_MAC uses TRANSFER_AUTH_KEY — the same key verify_perm_mac()
+    # uses at runtime, ensuring MAC computation and verification are consistent.
+    permission_mac = compute_permission_mac(transfer_auth_key, permissions)
     pin_hmac       = compute_pin_hmac(pin_key, hsm_pin)
 
     # ------------------------------------------------------------------ #
-    # secrets.h — extern const declarations                               #
+    # secrets.h — extern const declarations only                          #
     # ------------------------------------------------------------------ #
     header_path = os.path.join(inc_dir, 'secrets.h')
     with open(header_path, 'w') as f:
@@ -183,15 +204,20 @@ def secrets_to_c_header(
         f.write(' * @brief HSM deployment secrets — extern declarations (auto-generated)\n')
         f.write(' * @warning DO NOT COMMIT TO VERSION CONTROL\n')
         f.write(' *\n')
-        f.write(' * Key split:\n')
+        f.write(' * Key split (4 keys):\n')
         f.write(' *   STORAGE_KEY       — AES-256-GCM for files at rest.\n')
         f.write(' *   TRANSFER_KEY      — AES-256-GCM for files in transit.\n')
-        f.write(' *   TRANSFER_AUTH_KEY — HMAC for protocol auth (challenge-response).\n')
-        f.write(' *   PIN_KEY           — HMAC for PIN verification (runtime key).\n')
-        f.write(' *   PERM_KEY (absent) — Used at build time for PERMISSION_MAC only.\n')
+        f.write(' *   TRANSFER_AUTH_KEY — HMAC for protocol auth and PERMISSION_MAC.\n')
+        f.write(' *   PIN_KEY           — HMAC for PIN verification (runtime).\n')
         f.write(' *\n')
-        f.write(' * FIX B: PIN_HMAC replaces raw HSM_PIN.\n')
-        f.write(' * FIX D: extern const declarations only; definitions in secrets.c.\n')
+        f.write(' * Precomputed values:\n')
+        f.write(' *   PERMISSION_MAC = HMAC(TRANSFER_AUTH_KEY, perm_count || perms || "permission")\n')
+        f.write(' *   PIN_HMAC       = HMAC(PIN_KEY, pin_bytes || "pin")\n')
+        f.write(' *\n')
+        f.write(' * FIX B: PIN_HMAC replaces raw HSM_PIN in flash.\n')
+        f.write(' * FIX D: extern declarations only; definitions in secrets.c.\n')
+        f.write(' * FIX PERM: PERMISSION_MAC now uses TRANSFER_AUTH_KEY so runtime\n')
+        f.write(' *           verify_perm_mac() can successfully verify it.\n')
         f.write(' */\n\n')
         f.write('#ifndef __SECRETS_H__\n')
         f.write('#define __SECRETS_H__\n\n')
@@ -202,13 +228,13 @@ def secrets_to_c_header(
         f.write('extern const uint8_t STORAGE_KEY[32];\n\n')
         f.write('/* AES-256-GCM key for files in transit. */\n')
         f.write('extern const uint8_t TRANSFER_KEY[32];\n\n')
-        f.write('/* HMAC-SHA256 key for protocol challenge-response and permission MAC verify. */\n')
+        f.write('/* HMAC-SHA256 key for protocol challenge-response and PERMISSION_MAC. */\n')
         f.write('extern const uint8_t TRANSFER_AUTH_KEY[32];\n\n')
         f.write('/* HMAC-SHA256 key for PIN verification (separate from TRANSFER_AUTH_KEY). */\n')
         f.write('extern const uint8_t PIN_KEY[32];\n\n')
-        f.write('/* HMAC(PIN_KEY, pin_bytes || "pin"). FIX B: replaces raw HSM_PIN. */\n')
+        f.write('/* HMAC(PIN_KEY, pin_bytes || "pin"). Replaces raw HSM_PIN in flash. */\n')
         f.write('extern const uint8_t PIN_HMAC[32];\n\n')
-        f.write('/* HMAC(PERM_KEY, perm_count || permissions || "permission"). PERM_KEY not in firmware. */\n')
+        f.write('/* HMAC(TRANSFER_AUTH_KEY, perm_count || permissions || "permission"). */\n')
         f.write('extern const uint8_t PERMISSION_MAC[32];\n\n')
         f.write('/* Permission table — PERM_COUNT active entries, remainder zero-padded. */\n')
         f.write('extern const group_permission_t global_permissions[MAX_PERMS];\n\n')
@@ -224,10 +250,11 @@ def secrets_to_c_header(
         f.write(' * @brief HSM deployment secrets — definitions (auto-generated)\n')
         f.write(' * @warning DO NOT COMMIT TO VERSION CONTROL\n')
         f.write(' *\n')
-        f.write(' * PERM_KEY is build-time-only; it is not defined here.\n')
-        f.write(' * PIN_KEY is a runtime key stored here — separate from TRANSFER_AUTH_KEY.\n')
-        f.write(' * FIX B: PIN_HMAC = HMAC(PIN_KEY, pin_bytes || "pin").\n')
-        f.write(' * FIX D: single definition site; secrets.h has only extern decls.\n')
+        f.write(' * PERMISSION_MAC = HMAC(TRANSFER_AUTH_KEY, perm_count || perms || "permission")\n')
+        f.write(' * PIN_HMAC       = HMAC(PIN_KEY, pin_bytes || "pin")\n')
+        f.write(' *\n')
+        f.write(' * Both PERMISSION_MAC and PIN_HMAC are precomputed at build time by\n')
+        f.write(' * secrets_to_c_header.py and stored here as constants.\n')
         f.write(' */\n\n')
         f.write('#include "secrets.h"\n\n')
 
@@ -241,7 +268,7 @@ def secrets_to_c_header(
         f.write(bytes_to_c_array(transfer_key))
         f.write('\n};\n\n')
 
-        f.write('/* HMAC-SHA256 key for protocol challenge-response and permission MAC verify. */\n')
+        f.write('/* HMAC-SHA256 key for protocol challenge-response and PERMISSION_MAC. */\n')
         f.write('const uint8_t TRANSFER_AUTH_KEY[32] = {\n')
         f.write(bytes_to_c_array(transfer_auth_key))
         f.write('\n};\n\n')
@@ -251,12 +278,14 @@ def secrets_to_c_header(
         f.write(bytes_to_c_array(pin_key))
         f.write('\n};\n\n')
 
-        f.write('/* HMAC(PIN_KEY, pin_bytes || "pin"). FIX B: replaces raw HSM_PIN. */\n')
+        f.write('/* HMAC(PIN_KEY, pin_bytes || "pin"). Replaces raw HSM_PIN in flash. */\n')
         f.write('const uint8_t PIN_HMAC[32] = {\n')
         f.write(bytes_to_c_array(pin_hmac))
         f.write('\n};\n\n')
 
-        f.write('/* HMAC(PERM_KEY, perm_count || permissions || "permission"). */\n')
+        f.write('/* HMAC(TRANSFER_AUTH_KEY, perm_count || permissions || "permission").\n')
+        f.write(' * Verified at runtime by verify_perm_mac() using TRANSFER_AUTH_KEY.\n')
+        f.write(' * Both sides use the same key — computation and verification are consistent. */\n')
         f.write('const uint8_t PERMISSION_MAC[32] = {\n')
         f.write(bytes_to_c_array(permission_mac))
         f.write('\n};\n\n')
@@ -273,7 +302,7 @@ def secrets_to_c_header(
     print(f'Generated: {header_path}')
     print(f'Generated: {source_path}')
     print(f'  PERM_COUNT = {perm_count}')
-    print(f'  PERM_KEY not written to firmware.')
+    print(f'  PERMISSION_MAC computed with TRANSFER_AUTH_KEY.')
 
 
 if __name__ == '__main__':
