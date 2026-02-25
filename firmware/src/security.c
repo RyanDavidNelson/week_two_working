@@ -3,20 +3,10 @@
  * @brief Security primitives implementation for eCTF HSM
  * @date 2026
  *
- * Key split: check_pin_cmp() uses PIN_KEY for HMAC.  PIN_KEY is a runtime
- *   key stored in flash; CPA against check_pin_cmp recovers PIN_KEY but not
- *   TRANSFER_AUTH_KEY (they are independent 256-bit values).
- *
- * FIX A (P1/P2): SECURE_PIN_CHECK and SECURE_BOOL_CHECK macros (in security.h)
- *   harden every call site branch.  This file implements the underlying
- *   single-evaluation primitives; double-evaluation happens at the macro.
- *
- * FIX B (P3/P6): check_pin_cmp() computes HMAC(PIN_KEY, input_pin || "pin")
- *   and compares with the stored PIN_HMAC constant.  Raw PIN not in flash.
- *
- * SCA JITTER: random_delay_wide() uses two TRNG bytes (16-bit range) for a
- *   0–~20 ms pre-key-load jitter window.  random_delay() (one byte, 0–~4 ms)
- *   is retained for glitch desynchronisation between double-evaluation passes.
+ * This source file is part of an example system for MITRE's 2026 Embedded
+ * CTF (eCTF). This code is being provided only for educational purposes for
+ * the 2026 MITRE eCTF competition, and may not meet MITRE standards for
+ * quality. Use this code at your own risk!
  *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
@@ -24,20 +14,20 @@
 #include "security.h"
 #include "crypto.h"
 #include "secrets.h"
-#include "filesystem.h"
 #include "ti_msp_dl_config.h"
 #include <ti/driverlib/dl_trng.h>
 #include <ti/devices/msp/msp.h>
 
-/* Maximum iterations for TRNG busy-wait polls. */
+/* Hard cap on TRNG busy-wait iterations; security_halt() if exceeded. */
 #define TRNG_POLL_LIMIT 1000000UL
 
-/*
- * Timing Functions
- */
+/* ------------------------------------------------------------------ */
+/* Timing Functions                                                    */
+/* ------------------------------------------------------------------ */
 
 void delay_cycles(uint32_t cycles)
 {
+    /* Assembly delay from TI SDK dl_common.c — cycle-accurate busy wait. */
     uint32_t scratch;
     __asm volatile(
 #ifdef __GNUC__
@@ -54,7 +44,7 @@ void delay_cycles(uint32_t cycles)
 
 void delay_ms(uint32_t ms)
 {
-    /* Split into 100ms chunks to avoid uint32_t overflow. */
+    /* Split into 100 ms chunks to avoid uint32_t overflow on large delays. */
     while (ms >= 100) {
         delay_cycles(100 * CYCLES_PER_MS);
         ms -= 100;
@@ -75,8 +65,7 @@ void random_delay(void)
 void random_delay_wide(void)
 {
     /* 0–~20 ms jitter for SCA pre-key-load desynchronisation.
-     * Two TRNG bytes form a 16-bit value; scale to cycle count.
-     * Range: 0 to 65535 × (CYCLES_PER_MS / ~3) ≈ 0–640k cycles ≈ 0–20 ms.
+     * Two TRNG bytes → 16-bit value; range ~0–640k cycles ≈ 0–20 ms.
      * Wider window means CPA requires proportionally more traces. */
     uint32_t lo     = (uint32_t)trng_read_byte();
     uint32_t hi     = (uint32_t)trng_read_byte();
@@ -84,9 +73,9 @@ void random_delay_wide(void)
     delay_cycles(jitter);
 }
 
-/*
- * Memory Functions
- */
+/* ------------------------------------------------------------------ */
+/* Memory Functions                                                    */
+/* ------------------------------------------------------------------ */
 
 void secure_zero(void *ptr, size_t len)
 {
@@ -104,9 +93,9 @@ void security_halt(void)
     while (1) { __asm volatile("nop"); }
 }
 
-/*
- * Hardware TRNG Functions
- */
+/* ------------------------------------------------------------------ */
+/* Hardware TRNG Functions                                             */
+/* ------------------------------------------------------------------ */
 
 int trng_init(void)
 {
@@ -122,7 +111,8 @@ int trng_init(void)
     DL_TRNG_setClockDivider(TRNG, DL_TRNG_CLOCK_DIVIDE_2);
     DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
 
-    /* Poll until clock divider confirms normal mode. */
+    /* Poll until the clock divider register confirms normal-function mode.
+     * Loop counter poll_i in [0, TRNG_POLL_LIMIT). */
     for (poll_i = 0;
          DL_TRNG_getClockDivider(TRNG) != DL_TRNG_CLOCK_DIVIDE_2 &&
          poll_i < TRNG_POLL_LIMIT;
@@ -141,7 +131,8 @@ uint32_t trng_read_word(void)
 
     DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
 
-    /* Poll until capture ready, with limit. */
+    /* Poll until capture-ready flag is set.
+     * Loop counter poll_i in [0, TRNG_POLL_LIMIT). */
     for (poll_i = 0;
          !DL_TRNG_isCaptureReady(TRNG) && poll_i < TRNG_POLL_LIMIT;
          poll_i++) {}
@@ -158,14 +149,14 @@ uint8_t trng_read_byte(void)
     return (uint8_t)(trng_read_word() & 0xFF);
 }
 
-/*
- * Memory Functions
- */
+/* ------------------------------------------------------------------ */
+/* Authentication Functions                                            */
+/* ------------------------------------------------------------------ */
 
 bool secure_compare(const void *a, const void *b, size_t len)
 {
-    const uint8_t *pa = (const uint8_t *)a;
-    const uint8_t *pb = (const uint8_t *)b;
+    const uint8_t *pa  = (const uint8_t *)a;
+    const uint8_t *pb  = (const uint8_t *)b;
     uint8_t        acc = 0;
     size_t         i;
 
@@ -179,14 +170,18 @@ bool secure_compare(const void *a, const void *b, size_t len)
 }
 
 /*
- * check_pin_cmp — HMAC-based PIN check, single pass, no brute-force penalty.
+ * check_pin_cmp — single-pass HMAC-based PIN check, no brute-force penalty.
  *
- * Computes HMAC(PIN_KEY, pin || "pin") and compares with PIN_HMAC.
- * Called twice by SECURE_PIN_CHECK with random_delay() between passes.
+ * Receives the PIN as PIN_LENGTH ASCII hex bytes exactly as the host sent
+ * them (e.g. "1a2b3c").  Computes HMAC(PIN_KEY, pin || "pin") and
+ * constant-time compares with PIN_HMAC stored in secrets.c.
+ *
+ * Never call this directly from a command handler — always use check_pin(),
+ * which double-evaluates and applies the 5-second failure penalty.
  */
 bool check_pin_cmp(const unsigned char *pin)
 {
-    uint8_t computed_mac[HMAC_SIZE];
+    uint8_t computed[HMAC_SIZE];
     bool    result;
 
     if (pin == NULL) { return false; }
@@ -194,28 +189,31 @@ bool check_pin_cmp(const unsigned char *pin)
     if (hmac_sha256(PIN_KEY,
                     pin, PIN_LENGTH,
                     HMAC_DOMAIN_PIN,
-                    computed_mac) != 0) {
-        secure_zero(computed_mac, sizeof(computed_mac));
+                    computed) != 0) {
+        secure_zero(computed, sizeof(computed));
         return false;
     }
 
-    result = secure_compare(computed_mac, PIN_HMAC, HMAC_SIZE);
-    secure_zero(computed_mac, sizeof(computed_mac));
-
+    result = secure_compare(computed, PIN_HMAC, HMAC_SIZE);
+    secure_zero(computed, sizeof(computed));
     return result;
 }
 
 /*
  * check_pin — double-pass check_pin_cmp with random_delay between;
- * halt if passes disagree, 5-second penalty on wrong PIN.
+ * halt on pass disagreement, 5-second penalty on wrong PIN,
+ * zero the pin buffer on every exit path.
  */
 bool check_pin(unsigned char *pin)
 {
-    volatile bool r1, r2;
+    volatile bool r1;
+    volatile bool r2;
 
     r1 = check_pin_cmp(pin);
     random_delay();
     r2 = check_pin_cmp(pin);
+
+    secure_zero(pin, PIN_LENGTH);
 
     if ((bool)r1 != (bool)r2) {
         security_halt();
@@ -233,7 +231,7 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
 {
     volatile bool found_pass1 = false;
     volatile bool found_pass2 = false;
-    int i, j;
+    int           i, j;
 
     /* First pass — loop counter i in [0, PERM_COUNT). */
     for (i = 0; i < PERM_COUNT; i++) {
@@ -247,9 +245,7 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
         default: break;
         }
 
-        if (group_match && has_perm) {
-            found_pass1 = true;
-        }
+        if (group_match && has_perm) { found_pass1 = true; }
     }
 
     random_delay();
@@ -266,12 +262,10 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
         default: break;
         }
 
-        if (group_match && has_perm) {
-            found_pass2 = true;
-        }
+        if (group_match && has_perm) { found_pass2 = true; }
     }
 
-    /* Passes must agree; disagreement indicates fault injection. */
+    /* Passes must agree; disagreement indicates a fault injection attempt. */
     if ((bool)found_pass1 != (bool)found_pass2) {
         security_halt();
     }
@@ -279,9 +273,9 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
     return found_pass1;
 }
 
-/*
- * Input Validation Functions
- */
+/* ------------------------------------------------------------------ */
+/* Input Validation Functions                                          */
+/* ------------------------------------------------------------------ */
 
 bool validate_slot(uint8_t slot)
 {
@@ -294,22 +288,21 @@ bool validate_name(const char *name, size_t max_len)
 
     if (name == NULL) { return false; }
 
-    /* Loop counter i in [0, max_len); terminates at null or limit. */
+    /* Loop counter i in [0, max_len); terminates on null or bound. */
     for (i = 0; i < max_len; i++) {
         char c = name[i];
 
         if (c == '\0') {
-            return (i > 0); /* Must have at least one printable character. */
+            return (i > 0);  /* Must have at least one character before null. */
         }
 
-        /* Printable ASCII only: 0x20 (space) through 0x7E (~). */
-        if ((uint8_t)c < 0x20 || (uint8_t)c > 0x7E) {
+        /* Only printable ASCII 0x20–0x7E. */
+        if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7E) {
             return false;
         }
     }
 
-    /* Reached max_len without null terminator. */
-    return false;
+    return false;  /* No null terminator found within max_len bytes. */
 }
 
 bool validate_perm_count(uint8_t count)
@@ -324,5 +317,5 @@ bool validate_contents_len(uint16_t len)
 
 bool validate_bool(uint8_t value)
 {
-    return (value == 0u || value == 1u);
+    return (value == 0 || value == 1);
 }

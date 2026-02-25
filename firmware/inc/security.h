@@ -3,20 +3,6 @@
  * @brief Security primitives for eCTF HSM
  * @date 2026
  *
- *  FIX A (P1/P2) — SECURE_PIN_CHECK / SECURE_BOOL_CHECK macros.
- *    Every security-critical boolean branch is evaluated twice with a
- *    random_delay() between passes.  Disagreement → security_halt().
- *    Turns a single-glitch bypass into a required double-glitch.
- *
- *  FIX B (P3/P6) — HMAC-based PIN verification.
- *    check_pin_cmp() computes HMAC(PIN_KEY, input_pin || "pin") and
- *    compares with PIN_HMAC.  Raw PIN never stored in .rodata.
- *
- *  SCA JITTER — random_delay_wide() for pre-key-load desynchronisation.
- *    Uses two TRNG bytes for a 0–~20 ms window, substantially wider than
- *    random_delay() (0–~4 ms).  Called in crypto.c before every
- *    DL_AESADV_setKeyAligned() to slide the key-load power spike.
- *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 #ifndef __SECURITY_H__
@@ -26,9 +12,27 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define MAX_PERMS      8
-#define PIN_LENGTH     6
-#define CYCLES_PER_MS  32000
+/* ------------------------------------------------------------------ */
+/* Constants                                                           */
+/* ------------------------------------------------------------------ */
+
+#define MAX_PERMS         8
+#define MAX_FILE_COUNT    8
+#define MAX_NAME_SIZE     32
+#define MAX_CONTENTS_SIZE 8192
+
+/* PIN is exactly 6 lowercase hex ASCII characters as received from host
+ * (e.g. "1a2b3c").  check_pin_cmp() passes these 6 bytes directly to
+ * hmac_sha256(); secrets_to_c_header.py must use pin.encode('ascii') so
+ * the build-time PIN_HMAC matches what the runtime computes. */
+#define PIN_LENGTH    6
+
+/* MSPM0L2228 runs at 32 MHz. */
+#define CYCLES_PER_MS 32000
+
+/* ------------------------------------------------------------------ */
+/* Types                                                               */
+/* ------------------------------------------------------------------ */
 
 typedef enum {
     PERM_READ    = 'R',
@@ -38,56 +42,58 @@ typedef enum {
 
 typedef struct {
     uint16_t group_id;
-    bool read;
-    bool write;
-    bool receive;
+    bool     read;
+    bool     write;
+    bool     receive;
 } group_permission_t;
 
+/* ------------------------------------------------------------------ */
+/* Glitch-hardening macros                                             */
+/* ------------------------------------------------------------------ */
+
 /**
- * @defgroup SecureBranchMacros  Double-evaluation glitch-hardened branch macros
+ * SECURE_PIN_CHECK — double-evaluate check_pin_cmp() with random_delay()
+ * between passes.  Halts device on disagreement (single-glitch bypass
+ * becomes a required double-glitch).
  *
- * Callers declare ok1 and ok2 as `volatile bool`.
- * @{
+ * ok1, ok2 must be declared volatile bool by the caller.
+ * The caller is responsible for zeroing pin_ptr and applying the 5-second
+ * penalty on failure after this macro expands.
  */
-
-/**
- * SECURE_PIN_CHECK — double-evaluate check_pin_cmp(), halt on mismatch.
- * pin_ptr must remain valid for both evaluations.
- * Caller is responsible for zeroing pin_ptr and applying the 5-second
- * penalty on failure after this macro.
- */
-#define SECURE_PIN_CHECK(ok1, ok2, pin_ptr)        \
-    do {                                            \
-        (ok1) = check_pin_cmp(pin_ptr);            \
-        random_delay();                             \
-        (ok2) = check_pin_cmp(pin_ptr);            \
-        if ((bool)(ok1) != (bool)(ok2)) {          \
-            security_halt();                        \
-        }                                           \
+#define SECURE_PIN_CHECK(ok1, ok2, pin_ptr)         \
+    do {                                             \
+        (ok1) = check_pin_cmp(pin_ptr);             \
+        random_delay();                              \
+        (ok2) = check_pin_cmp(pin_ptr);             \
+        if ((bool)(ok1) != (bool)(ok2)) {           \
+            security_halt();                         \
+        }                                            \
     } while (0)
 
 /**
- * SECURE_BOOL_CHECK — double-evaluate any boolean expression, halt on mismatch.
- * expr must be side-effect-free (evaluated twice).
+ * SECURE_BOOL_CHECK — double-evaluate any side-effect-free boolean
+ * expression with random_delay() between passes.
+ * Halts device on disagreement.
  */
-#define SECURE_BOOL_CHECK(ok1, ok2, expr)          \
-    do {                                            \
-        (ok1) = (expr);                            \
-        random_delay();                             \
-        (ok2) = (expr);                            \
-        if ((bool)(ok1) != (bool)(ok2)) {          \
-            security_halt();                        \
-        }                                           \
+#define SECURE_BOOL_CHECK(ok1, ok2, expr)           \
+    do {                                             \
+        (ok1) = (expr);                             \
+        random_delay();                              \
+        (ok2) = (expr);                             \
+        if ((bool)(ok1) != (bool)(ok2)) {           \
+            security_halt();                         \
+        }                                            \
     } while (0)
 
-/** @} */
+/* ------------------------------------------------------------------ */
+/* Timing Functions                                                    */
+/* ------------------------------------------------------------------ */
 
-/*
- * Timing Functions
- */
+/** Calibrated busy-wait; pattern from TI SDK dl_common.c. */
+void delay_cycles(uint32_t cycles);
 
-void     delay_cycles(uint32_t cycles);
-void     delay_ms(uint32_t ms);
+/** Millisecond busy-wait; chunked to avoid uint32_t overflow. */
+void delay_ms(uint32_t ms);
 
 /**
  * @brief Short random jitter: 0–~4 ms from one TRNG byte.
@@ -95,54 +101,84 @@ void     delay_ms(uint32_t ms);
  * Used between double-evaluation passes in SECURE_PIN_CHECK and
  * SECURE_BOOL_CHECK to desynchronise fault-injection timing.
  */
-void     random_delay(void);
+void random_delay(void);
 
 /**
  * @brief Wide random jitter: 0–~20 ms from two TRNG bytes.
  *
- * Called in crypto.c immediately before each DL_AESADV_setKeyAligned()
- * to slide the key-load power spike across a larger trace window.
- * Wider range means CPA needs more traces to average through the noise.
+ * Called in crypto.c before every DL_AESADV_setKeyAligned() to slide the
+ * key-load power spike across a larger trace window.  Wider range means
+ * CPA needs proportionally more traces to average through the noise.
  */
-void     random_delay_wide(void);
+void random_delay_wide(void);
 
-/*
- * Memory Functions
- */
+/* ------------------------------------------------------------------ */
+/* Memory Functions                                                    */
+/* ------------------------------------------------------------------ */
 
-void     secure_zero(void *ptr, size_t len);
-void     security_halt(void) __attribute__((noreturn));
+/** Volatile-pointer zero — not optimised away by the compiler. */
+void secure_zero(void *ptr, size_t len);
 
-/*
- * Hardware TRNG Functions
- */
+/** Disable IRQ and spin forever.  Called on any security invariant breach. */
+void security_halt(void) __attribute__((noreturn));
 
+/* ------------------------------------------------------------------ */
+/* Hardware TRNG Functions                                             */
+/* ------------------------------------------------------------------ */
+
+/** Initialise TRNG; calls security_halt() if self-test exceeds poll limit. */
 int      trng_init(void);
+
+/** Read one 32-bit word from TRNG; security_halt() on poll timeout. */
 uint32_t trng_read_word(void);
+
+/** Read one byte from TRNG (low byte of trng_read_word()). */
 uint8_t  trng_read_byte(void);
 
-/*
- * Authentication Functions
+/* ------------------------------------------------------------------ */
+/* Authentication Functions                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @brief Constant-time byte comparison.  XOR accumulator, no early exit.
+ *        Used for all HMAC tag comparisons.
  */
+bool secure_compare(const void *a, const void *b, size_t len);
 
-/** Constant-time byte-wise comparison (no early exit). */
-bool     secure_compare(const void *a, const void *b, size_t len);
+/**
+ * @brief Single-pass HMAC-based PIN check.  No brute-force penalty.
+ *
+ * Computes HMAC(PIN_KEY, pin[PIN_LENGTH] || "pin") and constant-time
+ * compares with PIN_HMAC from flash.  Never called directly by command
+ * handlers — always invoked through check_pin() which double-evaluates.
+ *
+ * @param pin  Exactly PIN_LENGTH bytes as received from the host (the 6
+ *             ASCII hex characters, e.g. "1a2b3c").
+ */
+bool check_pin_cmp(const unsigned char *pin);
 
-/** Single-pass HMAC-based PIN check (no penalty). */
-bool     check_pin_cmp(const unsigned char *pin);
+/**
+ * @brief Double-pass PIN check with 5-second penalty on failure.
+ *
+ * Calls check_pin_cmp() twice with random_delay() between passes.
+ * Calls security_halt() if passes disagree.
+ * Zeros the pin buffer on every exit path.
+ */
+bool check_pin(unsigned char *pin);
 
-/** Double-pass PIN check with 5-second penalty on failure. */
-bool     check_pin(unsigned char *pin);
+/**
+ * @brief Double-pass permission lookup; calls security_halt() on disagreement.
+ */
+bool validate_permission(uint16_t group_id, permission_enum_t perm);
 
-/** Double-pass permission lookup; halts on disagreement. */
-bool     validate_permission(uint16_t group_id, permission_enum_t perm);
+/* ------------------------------------------------------------------ */
+/* Input Validation Functions                                          */
+/* ------------------------------------------------------------------ */
 
-bool     validate_slot(uint8_t slot);
-bool     validate_name(const char *name, size_t max_len);
-bool     validate_perm_count(uint8_t count);
-bool     validate_contents_len(uint16_t len);
-bool     validate_bool(uint8_t value);
-
-/* Note: validate_perm_bytes() is static in commands.c — not declared here. */
+bool validate_slot(uint8_t slot);
+bool validate_name(const char *name, size_t max_len);
+bool validate_perm_count(uint8_t count);
+bool validate_contents_len(uint16_t len);
+bool validate_bool(uint8_t value);
 
 #endif  /* __SECURITY_H__ */

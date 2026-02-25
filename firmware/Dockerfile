@@ -4,14 +4,13 @@
 
 FROM ubuntu:24.04
 
-LABEL version="0.2"
-LABEL description="Example HSM Docker Container for the 2026 eCTF"
+LABEL version="0.3"
+LABEL description="UTD HSM Docker Container for the 2026 eCTF"
 
 ARG DEBIAN_FRONTEND=noninteractive
 WORKDIR /root
 
-# Install Requisite Packages
-# do this first because it takes the longest
+# Install requisite packages — do this first because it takes the longest
 RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     python3 \
     make \
@@ -27,11 +26,15 @@ RUN wget https://github.com/TexasInstruments/mspm0-sdk/archive/refs/tags/mspm0_s
     unzip mspm0_sdk_2_06_00_05.zip -d /opt && \
     rm -f -r mspm0_sdk_2_06_00_05.zip ${MSPM0_SDK_INSTALL_DIR}/docs ${MSPM0_SDK_INSTALL_DIR}/examples
 
-# Install TI-Clang for curr machine's arch
+# Install TI-Clang for the current machine's architecture
 RUN if [ $(uname -m) = "x86_64" ]; then \
-    wget -O ti_cgt_armllvm_4.0.3.LTS_linux_installer.bin https://dr-download.ti.com/software-development/ide-configuration-compiler-or-debugger/MD-ayxs93eZNN/4.0.3.LTS/ti_cgt_armllvm_4.0.3.LTS_linux-x64_installer.bin --ca-certificate=SSLCerts/mitre-chain.pem; \
+    wget -O ti_cgt_armllvm_4.0.3.LTS_linux_installer.bin \
+        https://dr-download.ti.com/software-development/ide-configuration-compiler-or-debugger/MD-ayxs93eZNN/4.0.3.LTS/ti_cgt_armllvm_4.0.3.LTS_linux-x64_installer.bin \
+        --ca-certificate=SSLCerts/mitre-chain.pem; \
     elif [ $(uname -m) = "aarch64" ] || [ $(uname -m) = "arm64" ]; then \
-    wget -O ti_cgt_armllvm_4.0.3.LTS_linux_installer.bin https://dr-download.ti.com/software-development/ide-configuration-compiler-or-debugger/MD-ayxs93eZNN/4.0.3.LTS/ti_cgt_armllvm_4.0.3.LTS_linux-arm64_installer.bin --ca-certificate=SSLCerts/mitre-chain.pem; \
+    wget -O ti_cgt_armllvm_4.0.3.LTS_linux_installer.bin \
+        https://dr-download.ti.com/software-development/ide-configuration-compiler-or-debugger/MD-ayxs93eZNN/4.0.3.LTS/ti_cgt_armllvm_4.0.3.LTS_linux-arm64_installer.bin \
+        --ca-certificate=SSLCerts/mitre-chain.pem; \
     else \
     $(false); \
     fi && \
@@ -39,7 +42,28 @@ RUN if [ $(uname -m) = "x86_64" ]; then \
     ./ti_cgt_armllvm_4.0.3.LTS_linux_installer.bin --mode unattended --prefix /opt && \
     rm -f ti_cgt_armllvm_4.0.3.LTS_linux_installer.bin
 
+# ---------------------------------------------------------------------------
+# Install wolfSSL 5.7.0 (wolfcrypt only — HMAC-SHA256 for check_pin_cmp).
+#
+# IMPORTANT: ./firmware is volume-mounted to /hsm at "docker run" time.
+# Anything written to /hsm during the image build is hidden by that mount.
+# wolfSSL MUST be installed outside /hsm — we use /opt/wolfssl.
+#
+# GitHub archive extracts as wolfssl-v5.7.0-stable/:
+#   wolfssl-v5.7.0-stable/wolfssl/wolfcrypt/hmac.h   <- headers
+#   wolfssl-v5.7.0-stable/wolfcrypt/src/hmac.c       <- sources
+#
+# After the mv, the Makefile finds them via:
+#   CFLAGS  += -I/opt/wolfssl               (resolves <wolfssl/wolfcrypt/hmac.h>)
+#   WOLFSSL_SRC = /opt/wolfssl/wolfcrypt/src (source compile rule)
+# ---------------------------------------------------------------------------
+ENV WOLFSSL_INSTALL_DIR=/opt/wolfssl
+RUN wget -O wolfssl.zip \
+        https://github.com/wolfSSL/wolfssl/archive/refs/tags/v5.7.0-stable.zip && \
+    unzip wolfssl.zip && \
+    mv wolfssl-5.7.0-stable ${WOLFSSL_INSTALL_DIR} && \
+    rm -f wolfssl.zip
+
 WORKDIR /hsm
 
 ENTRYPOINT ["bash", "/hsm/build.sh"]
-

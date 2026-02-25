@@ -2,11 +2,11 @@ MSPM0_SDK_INSTALL_DIR ?= $(abspath ../../../../../..)
 
 include $(MSPM0_SDK_INSTALL_DIR)/tools/imports_mak/imports.mak.linux
 
-CC = "$(TICLANG_ARMCOMPILER)/bin/tiarmclang"
-LNK = "$(TICLANG_ARMCOMPILER)/bin/tiarmclang"
+CC      = "$(TICLANG_ARMCOMPILER)/bin/tiarmclang"
+LNK     = "$(TICLANG_ARMCOMPILER)/bin/tiarmclang"
 OBJCOPY = "$(TICLANG_ARMCOMPILER)/bin/tiarmobjcopy"
-BUILDDIR ?= /tmp/build
-VPATH = "src"
+BUILDDIR   ?= /tmp/build
+VPATH      = "src"
 LINKERFILE = "firmware.ld"
 
 # =============================================================================
@@ -25,62 +25,57 @@ OBJECTS = $(BUILDDIR)/HSM.so \
     $(BUILDDIR)/secrets.so
 
 # =============================================================================
-# WolfSSL Configuration - HMAC-SHA256 only (no TLS)
+# WolfSSL configuration — wolfcrypt only, AES-256-GCM + HMAC-SHA256
+#
+# wolfSSL lives at /opt/wolfssl inside the Docker image (baked in during
+# "docker build").  It cannot be at ./wolfssl because the firmware directory
+# is volume-mounted to /hsm at "docker run" time.
+#
+# Settings strategy:
+#   -DWOLFSSL_USER_SETTINGS causes settings.h to include user_settings.h
+#   which carries the full configuration.  The three AES-GCM flags are also
+#   set on the CFLAGS line so every translation unit sees them regardless of
+#   include order.  user_settings.h uses #ifndef guards so the CFLAGS values
+#   take precedence and no -Wmacro-redefined warning fires.
+#
+# Three GCM flags are required — all must be set:
+#   WOLFSSL_AES_GCM : top-level enable, processed early by settings.h
+#   HAVE_AES_GCM   : public API gate, controls prototypes in aes.h
+#   HAVE_AESGCM    : internal compilation gate, controls function bodies
+#                    in aes.c — this is the gate that was missing and caused
+#                    wc_AesGcmSetKey/Encrypt/Decrypt to be absent from aes.so
+#
+# NO_AES_CBC intentionally absent:
+#   In wolfssl 5.7.0, the AES lookup tables (Te[], Td[]) and GetTable() are
+#   compiled under the CBC code path.  GCM's internal AES block encrypt calls
+#   into that same table path.  Setting NO_AES_CBC excluded the tables,
+#   which excluded GCM, producing the unresolved symbol link error.
+#   CBC is compiled in but never called; the flash cost is acceptable.
 # =============================================================================
-# Core: wolfcrypt only, no TLS stack
-CFLAGS += -DWOLFCRYPT_ONLY
-CFLAGS += -DNO_WOLFSSL_DIR
 
-# Embedded environment
-CFLAGS += -DSINGLE_THREADED
-CFLAGS += -DNO_FILESYSTEM
-CFLAGS += -DNO_WRITEV
-CFLAGS += -DTIME_T_NOT_64BIT
+WOLFSSL_INSTALL_DIR = /opt/wolfssl
+WOLFSSL_SRC         = $(WOLFSSL_INSTALL_DIR)/wolfcrypt/src
 
-# We handle RNG ourselves via hardware TRNG
-CFLAGS += -DNO_DEV_RANDOM
-CFLAGS += -DWC_NO_HASHDRBG
-
-# Callbacks (required for bare metal)
-CFLAGS += -DHAVE_PK_CALLBACKS
-CFLAGS += -DWOLFSSL_USER_IO
-CFLAGS += -DWC_NO_DEFAULT_DEVID
-CFLAGS += -DNO_CRYPTO_CB
-
-# Disable ALL unused algorithms (we only need SHA256 + HMAC)
-CFLAGS += -DNO_MD4
-CFLAGS += -DNO_MD5
-CFLAGS += -DNO_SHA
-CFLAGS += -DNO_SHA384
-CFLAGS += -DNO_SHA512
-CFLAGS += -DNO_AES
-CFLAGS += -DNO_DES3
-CFLAGS += -DNO_RSA
-CFLAGS += -DNO_DSA
-CFLAGS += -DNO_DH
-CFLAGS += -DNO_RC4
-CFLAGS += -DNO_RABBIT
-CFLAGS += -DNO_HC128
-CFLAGS += -DNO_PSK
-CFLAGS += -DNO_PWDBASED
-CFLAGS += -DNO_CODING
-CFLAGS += -DNO_ASN
-CFLAGS += -DNO_CERTS
-CFLAGS += -DNO_SIG_WRAPPER
-
-# WolfSSL include path
-CFLAGS += -I./wolfssl
-
-# =============================================================================
-# WolfSSL source objects — compiled into BUILDDIR (not the source tree) so
-# stale .o files never accumulate in the mounted host volume between builds.
-# =============================================================================
-WOLFSSL_SRC = wolfssl/wolfcrypt/src
+# wolfSSL compiled objects
 OBJECTS += $(BUILDDIR)/sha256.so \
            $(BUILDDIR)/hmac.so \
            $(BUILDDIR)/hash.so \
            $(BUILDDIR)/memory.so \
-           $(BUILDDIR)/wc_port.so
+           $(BUILDDIR)/wc_port.so \
+           $(BUILDDIR)/aes.so
+
+# Activate user_settings.h for all translation units
+CFLAGS += -DWOLFSSL_USER_SETTINGS
+
+# All three GCM gates on the command line — ensures every TU sees them
+# before any wolfssl conditional chain runs.  user_settings.h #ifndef guards
+# prevent redefinition warnings.
+CFLAGS += -DWOLFSSL_AES_GCM
+CFLAGS += -DHAVE_AES_GCM
+CFLAGS += -DHAVE_AESGCM
+
+# wolfSSL include path
+CFLAGS += -I$(WOLFSSL_INSTALL_DIR)
 
 # =============================================================================
 # Compiler flags
@@ -127,7 +122,7 @@ $(BUILDDIR)/%.so: ./src/%.c | $(BUILDDIR)
 	@ echo Building $@
 	@ $(CC) $(CFLAGS) -c $< -o $@
 
-# WolfSSL source files → BUILDDIR (separate rule for the wolfssl source path)
+# wolfSSL source files → BUILDDIR
 $(BUILDDIR)/%.so: $(WOLFSSL_SRC)/%.c | $(BUILDDIR)
 	@ echo Building WolfSSL: $@
 	@ $(CC) $(CFLAGS) -c $< -o $@
