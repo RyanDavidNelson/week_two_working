@@ -51,10 +51,14 @@ typedef struct {
 /* Glitch-hardening macros                                             */
 /* ------------------------------------------------------------------ */
 
-/**
- * SECURE_PIN_CHECK — double-evaluate check_pin_cmp() with random_delay()
- * between passes.  Halts device on disagreement (single-glitch bypass
- * becomes a required double-glitch).
+/*
+ * SECURE_PIN_CHECK — double-evaluate check_pin_cmp() with no delay between
+ * passes.  Halts device on disagreement (single-glitch bypass still requires
+ * a double-glitch to defeat both passes simultaneously).
+ *
+ * random_delay() was removed: we do not defend against double-glitch attacks,
+ * and timing/power analysis on the PIN path is handled by the XOR accumulator
+ * in secure_compare() and wolfcrypt's bitsliced AES.
  *
  * ok1, ok2 must be declared volatile bool by the caller.
  * The caller is responsible for zeroing pin_ptr and applying the 5-second
@@ -63,22 +67,22 @@ typedef struct {
 #define SECURE_PIN_CHECK(ok1, ok2, pin_ptr)         \
     do {                                             \
         (ok1) = check_pin_cmp(pin_ptr);             \
-        random_delay();                              \
         (ok2) = check_pin_cmp(pin_ptr);             \
         if ((bool)(ok1) != (bool)(ok2)) {           \
             security_halt();                         \
         }                                            \
     } while (0)
 
-/**
+/*
  * SECURE_BOOL_CHECK — double-evaluate any side-effect-free boolean
- * expression with random_delay() between passes.
- * Halts device on disagreement.
+ * expression with no delay between passes.
+ * Halts device on disagreement (single fault injection still caught).
+ *
+ * random_delay() removed for same reasons as SECURE_PIN_CHECK.
  */
 #define SECURE_BOOL_CHECK(ok1, ok2, expr)           \
     do {                                             \
         (ok1) = (expr);                             \
-        random_delay();                              \
         (ok2) = (expr);                             \
         if ((bool)(ok1) != (bool)(ok2)) {           \
             security_halt();                         \
@@ -98,17 +102,19 @@ void delay_ms(uint32_t ms);
 /**
  * @brief Short random jitter: 0–~4 ms from one TRNG byte.
  *
- * Used between double-evaluation passes in SECURE_PIN_CHECK and
- * SECURE_BOOL_CHECK to desynchronise fault-injection timing.
+ * Available for future use.  No longer called on any hot path —
+ * double-glitch defence is out of scope and timing analysis is handled
+ * by the XOR accumulator + wolfcrypt bitsliced AES.
  */
 void random_delay(void);
 
 /**
  * @brief Wide random jitter: 0–~20 ms from two TRNG bytes.
  *
- * Called in crypto.c before every DL_AESADV_setKeyAligned() to slide the
- * key-load power spike across a larger trace window.  Wider range means
- * CPA needs proportionally more traces to average through the noise.
+ * Called in crypto.c before every wc_AesGcmSetKey() to slide the
+ * key-schedule power signature across a larger trace window.  Wider
+ * range means CPA requires proportionally more traces to average out.
+ * Only used on the AES path; does not affect interrogate timing.
  */
 void random_delay_wide(void);
 
@@ -147,27 +153,19 @@ bool secure_compare(const void *a, const void *b, size_t len);
 
 /**
  * @brief Single-pass HMAC-based PIN check.  No brute-force penalty.
- *
- * Computes HMAC(PIN_KEY, pin[PIN_LENGTH] || "pin") and constant-time
- * compares with PIN_HMAC from flash.  Never called directly by command
- * handlers — always invoked through check_pin() which double-evaluates.
- *
- * @param pin  Exactly PIN_LENGTH bytes as received from the host (the 6
- *             ASCII hex characters, e.g. "1a2b3c").
+ *        Never call directly — always use SECURE_PIN_CHECK or check_pin().
  */
 bool check_pin_cmp(const unsigned char *pin);
 
 /**
- * @brief Double-pass PIN check with 5-second penalty on failure.
- *
- * Calls check_pin_cmp() twice with random_delay() between passes.
- * Calls security_halt() if passes disagree.
- * Zeros the pin buffer on every exit path.
+ * @brief Double-pass PIN check with 5-second failure penalty.
+ *        Zeros pin buffer on all exit paths.
  */
 bool check_pin(unsigned char *pin);
 
 /**
- * @brief Double-pass permission lookup; calls security_halt() on disagreement.
+ * @brief Double-pass permission check for local group permissions.
+ *        Halts on pass disagreement (single-fault resistance).
  */
 bool validate_permission(uint16_t group_id, permission_enum_t perm);
 
@@ -181,4 +179,4 @@ bool validate_perm_count(uint8_t count);
 bool validate_contents_len(uint16_t len);
 bool validate_bool(uint8_t value);
 
-#endif  /* __SECURITY_H__ */
+#endif /* __SECURITY_H__ */

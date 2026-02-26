@@ -56,18 +56,21 @@ void delay_ms(uint32_t ms)
 
 void random_delay(void)
 {
-    /* 0–~4 ms jitter. One byte × 32 cycles ≈ 4 ms max at 32 MHz. */
-    uint32_t jitter = (uint32_t)(trng_read_byte() & 0x7F) * (CYCLES_PER_MS / 8000);
+    /* 0–~4 ms jitter from one TRNG byte.  Kept for future use but no longer
+     * called on any hot path — double-glitch is out of scope, and timing
+     * analysis is handled by the XOR accumulator + wolfcrypt bitsliced AES. */
+    uint32_t jitter = (uint32_t)(trng_read_byte() & 0x7F) * (CYCLES_PER_MS / 32);
     delay_cycles(jitter);
 }
 
 void random_delay_wide(void)
 {
     /* 0–~20 ms jitter for SCA pre-key-load desynchronisation.
-     * Two TRNG bytes → 16-bit value × 10 cycles ≈ 655 k cycles ≈ 20 ms at 32 MHz. */
+     * Two TRNG bytes → 16-bit value; range ~0–640k cycles ≈ 0–20 ms.
+     * Wider window means CPA requires proportionally more traces. */
     uint32_t lo     = (uint32_t)trng_read_byte();
     uint32_t hi     = (uint32_t)trng_read_byte();
-    uint32_t jitter = ((hi << 8) | lo) * (CYCLES_PER_MS / 3000);
+    uint32_t jitter = ((hi << 8) | lo) * (CYCLES_PER_MS / 3277);
     delay_cycles(jitter);
 }
 
@@ -198,9 +201,13 @@ bool check_pin_cmp(const unsigned char *pin)
 }
 
 /*
- * check_pin — double-pass check_pin_cmp with random_delay between;
- * halt on pass disagreement, 5-second penalty on wrong PIN,
- * zero the pin buffer on every exit path.
+ * check_pin — double-pass check_pin_cmp with no random delay between passes.
+ *
+ * The double-pass catches any single fault injection that flips the result of
+ * one evaluation; both passes must agree or we halt.  random_delay() between
+ * passes is not needed because double-glitch attacks are out of scope.
+ *
+ * Applies 5-second penalty on wrong PIN; zeros pin buffer on every exit path.
  */
 bool check_pin(unsigned char *pin)
 {
@@ -208,8 +215,7 @@ bool check_pin(unsigned char *pin)
     volatile bool r2;
 
     r1 = check_pin_cmp(pin);
-    random_delay();
-    r2 = check_pin_cmp(pin);
+    r2 = check_pin_cmp(pin);   /* no random_delay — double-glitch out of scope */
 
     secure_zero(pin, PIN_LENGTH);
 
@@ -225,13 +231,24 @@ bool check_pin(unsigned char *pin)
     return true;
 }
 
+/*
+ * validate_permission — double-pass local permission check.
+ *
+ * Scans global_permissions[] twice without random_delay between passes.
+ * A single fault injection that flips found_pass1 but not found_pass2 (or
+ * vice-versa) is caught by the agreement check; security_halt() fires.
+ * random_delay() removed — double-glitch is out of scope.
+ *
+ * Loop counter i in [0, PERM_COUNT); terminates when i == PERM_COUNT.
+ * Loop counter j in [0, PERM_COUNT); terminates when j == PERM_COUNT.
+ */
 bool validate_permission(uint16_t group_id, permission_enum_t perm)
 {
     volatile bool found_pass1 = false;
     volatile bool found_pass2 = false;
     int           i, j;
 
-    /* First pass — loop counter i in [0, PERM_COUNT). */
+    /* First pass. */
     for (i = 0; i < PERM_COUNT; i++) {
         bool group_match = (global_permissions[i].group_id == group_id);
         bool has_perm    = false;
@@ -246,9 +263,7 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
         if (group_match && has_perm) { found_pass1 = true; }
     }
 
-    random_delay();
-
-    /* Second pass — loop counter j in [0, PERM_COUNT). */
+    /* Second pass — no random_delay between passes. */
     for (j = 0; j < PERM_COUNT; j++) {
         bool group_match = (global_permissions[j].group_id == group_id);
         bool has_perm    = false;

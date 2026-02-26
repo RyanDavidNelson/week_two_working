@@ -31,12 +31,20 @@
 #define CONFIG_UART_COUNT    2
 
 /*
- * Approximate iteration count for a ~1 second timeout on TRANSFER_INTERFACE.
- * DL_UART_isRXFIFOEmpty polls the UART RX FIFO status register.
- * At 32 MHz with ~9-10 cycles per loop body, 3,200,000 iterations ≈ 1 s.
- * Used only on TRANSFER_INTERFACE; CONTROL_INTERFACE blocks indefinitely.
+ * Per-byte timeout for TRANSFER_INTERFACE reads.
+ *
+ * The listen board must complete all crypto (HMAC verifications, flash reads,
+ * perm checks, resp_auth) before sending its first byte of R2/R4.  Without
+ * random_delay() calls that processing takes ~50 ms worst case; flash reads
+ * can add another ~50 ms.  Setting the timeout to ~3 seconds gives ample
+ * margin without approaching the 5-second host-side operation deadline.
+ *
+ * At 32 MHz with ~9-10 cycles per loop body:
+ *   9,600,000 iterations × 10 cycles / 32,000,000 Hz ≈ 3 seconds
+ *
+ * Only used on TRANSFER_INTERFACE; CONTROL_INTERFACE blocks indefinitely.
  */
-#define UART_TRANSFER_TIMEOUT_CYCLES  3200000U
+#define UART_TRANSFER_TIMEOUT_CYCLES  9600000U
 
 /******************************** FUNCTION PROTOTYPES ******************************/
 
