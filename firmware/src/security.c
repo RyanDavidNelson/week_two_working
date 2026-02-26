@@ -56,20 +56,18 @@ void delay_ms(uint32_t ms)
 
 void random_delay(void)
 {
-    /* 0–~4 ms jitter for glitch desynchronisation between double-eval passes.
-     * One TRNG byte → 7-bit value × (CYCLES_PER_MS/8) cycles. */
-    uint32_t jitter = (uint32_t)(trng_read_byte() & 0x7F) * (CYCLES_PER_MS / 8);
+    /* 0–~4 ms jitter. One byte × 32 cycles ≈ 4 ms max at 32 MHz. */
+    uint32_t jitter = (uint32_t)(trng_read_byte() & 0x7F) * (CYCLES_PER_MS / 8000);
     delay_cycles(jitter);
 }
 
 void random_delay_wide(void)
 {
     /* 0–~20 ms jitter for SCA pre-key-load desynchronisation.
-     * Two TRNG bytes → 16-bit value; range ~0–640k cycles ≈ 0–20 ms.
-     * Wider window means CPA requires proportionally more traces. */
+     * Two TRNG bytes → 16-bit value × 10 cycles ≈ 655 k cycles ≈ 20 ms at 32 MHz. */
     uint32_t lo     = (uint32_t)trng_read_byte();
     uint32_t hi     = (uint32_t)trng_read_byte();
-    uint32_t jitter = ((hi << 8) | lo) * (CYCLES_PER_MS / 3);
+    uint32_t jitter = ((hi << 8) | lo) * (CYCLES_PER_MS / 3000);
     delay_cycles(jitter);
 }
 
