@@ -15,7 +15,7 @@
 #include <stdint.h>
 
 /* Number of active entries in global_permissions[]. */
-#define PERM_COUNT 1
+#define PERM_COUNT 2
 
 /* AES-256-GCM key for files at rest. */
 extern const uint8_t STORAGE_KEY[32];
