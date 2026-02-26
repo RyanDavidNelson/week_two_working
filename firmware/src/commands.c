@@ -674,6 +674,12 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
  * Without this, a leftover '%I' framing byte from a failed interrogate could
  * be misread as the start of R1 on the next listen call.
  *
+ * uart_drain_rx() is non-blocking — it only discards bytes already in the
+ * FIFO right now, so it cannot accidentally consume the peer's fresh R1.
+ * The old blocking drain used uart_readbyte_timeout() which waited up to
+ * 3 seconds per byte and consumed legitimate R1 header bytes that arrived
+ * while the drain was running, causing an inter-board deadlock.
+ *
  * RECEIVE_MSG stack peak:
  *   union u { file_t stored; receive_r4_t fdata } = 8277 B
  *   r2(44) + r3(105) + nonces/aads/misc ≈ 600 B
@@ -703,18 +709,10 @@ int listen(uint16_t pkt_len, uint8_t *buf)
     write_packet(CONTROL_INTERFACE, LISTEN_MSG, NULL, 0);
     print_debug("LSN: host ack sent, draining stale UART1 bytes");
 
-    /* Drain any bytes left from a prior aborted exchange.
-     * Loop counter drain_i in [0, MAX_SYNC_DISCARD); terminates when FIFO
-     * empty (timeout) or limit reached. */
-    {
-        int     stale_byte;
-        uint8_t drain_i;
-        for (drain_i = 0; drain_i < MAX_SYNC_DISCARD; drain_i++) {
-            if (uart_readbyte_timeout(TRANSFER_INTERFACE, &stale_byte) != 0) {
-                break;  /* FIFO empty */
-            }
-        }
-    }
+    /* Flush stale bytes already sitting in the RX FIFO from a prior exchange.
+     * uart_drain_rx is non-blocking — it only discards bytes present NOW,
+     * so it cannot accidentally consume the peer's fresh R1 header. */
+    (void)uart_drain_rx(TRANSFER_INTERFACE, MAX_SYNC_DISCARD);
     print_debug("LSN: blocking on UART1");
 
     memset(first_buf, 0, sizeof(first_buf));
