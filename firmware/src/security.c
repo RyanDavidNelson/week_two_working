@@ -100,8 +100,7 @@ void security_halt(void)
 
 int trng_init(void)
 {
-    uint32_t poll_i;
-
+    /* Enable power and wait for stabilization */
     DL_TRNG_enablePower(TRNG);
 #ifdef POWER_STARTUP_DELAY
     delay_cycles(POWER_STARTUP_DELAY);
@@ -109,46 +108,77 @@ int trng_init(void)
     delay_cycles(32000);
 #endif
 
+    /* Set clock divider (32MHz / 2 = 16MHz for TRNG) */
     DL_TRNG_setClockDivider(TRNG, DL_TRNG_CLOCK_DIVIDE_2);
-    DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
 
-    /* Poll until the clock divider register confirms normal-function mode.
-     * Loop counter poll_i in [0, TRNG_POLL_LIMIT). */
-    for (poll_i = 0;
-         DL_TRNG_getClockDivider(TRNG) != DL_TRNG_CLOCK_DIVIDE_2 &&
-         poll_i < TRNG_POLL_LIMIT;
-         poll_i++) {}
+    /* Digital self-test */
+    DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_TEST_DIG);
+    while (!DL_TRNG_isCommandDone(TRNG))
+        ;
+    DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CMD_DONE_EVENT);
 
-    if (poll_i >= TRNG_POLL_LIMIT) {
-        security_halt();
+    /* Must delay before reading test results (per TI documentation) */
+    delay_cycles(100000);
+
+    if (DL_TRNG_getDigitalHealthTestResults(TRNG) != DL_TRNG_DIGITAL_HEALTH_TEST_SUCCESS) {
+        return -1;
     }
+
+    /* Analog self-test */
+    DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_TEST_ANA);
+    while (!DL_TRNG_isCommandDone(TRNG))
+        ;
+    DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CMD_DONE_EVENT);
+
+    delay_cycles(100000);
+
+    if (DL_TRNG_getAnalogHealthTestResults(TRNG) != DL_TRNG_ANALOG_HEALTH_TEST_SUCCESS) {
+        return -2;
+    }
+
+    /* Enter normal operation mode */
+    DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
+    while (!DL_TRNG_isCommandDone(TRNG))
+        ;
+    DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CMD_DONE_EVENT);
+
+    DL_TRNG_setDecimationRate(TRNG, DL_TRNG_DECIMATION_RATE_4);
 
     return 0;
 }
 
 uint32_t trng_read_word(void)
 {
-    uint32_t poll_i;
+    /* Wait for capture to be ready */
+    while (!DL_TRNG_isCaptureReady(TRNG))
+        ;
 
+    uint32_t value = DL_TRNG_getCapture(TRNG);
+    DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CAPTURE_RDY_EVENT);
+
+    /* Trigger next capture (TRNG doesn't auto-generate) */
     DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
 
-    /* Poll until capture-ready flag is set.
-     * Loop counter poll_i in [0, TRNG_POLL_LIMIT). */
-    for (poll_i = 0;
-         !DL_TRNG_isCaptureReady(TRNG) && poll_i < TRNG_POLL_LIMIT;
-         poll_i++) {}
-
-    if (poll_i >= TRNG_POLL_LIMIT) {
-        security_halt();
-    }
-
-    return DL_TRNG_getCapture(TRNG);
+    return value;
 }
 
 uint8_t trng_read_byte(void)
 {
-    return (uint8_t)(trng_read_word() & 0xFF);
+    static uint32_t cached_word = 0;
+    static uint8_t bytes_remaining = 0;
+
+    if (bytes_remaining == 0) {
+        cached_word = trng_read_word();
+        bytes_remaining = 4;
+    }
+
+    uint8_t result = (uint8_t)(cached_word & 0xFF);
+    cached_word >>= 8;
+    bytes_remaining--;
+
+    return result;
 }
+
 
 /* ------------------------------------------------------------------ */
 /* Authentication Functions                                            */

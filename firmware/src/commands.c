@@ -421,6 +421,7 @@ int receive(uint16_t pkt_len, uint8_t *buf)
         return -1;
     }
     print_debug("RCV: sending R1 on UART1");
+    delay_ms(200);
     if (write_packet(TRANSFER_INTERFACE, RECEIVE_MSG, &r1, sizeof(r1)) != MSG_OK) {
         print_debug("RCV: R1 write fail (no peer ACK)");
         secure_zero(&r1, sizeof(r1));
