@@ -3,44 +3,41 @@
  * @brief Cryptographic implementation for eCTF HSM
  * @date 2026
  *
- * wolfcrypt-only AES-GCM.  All DL_AESADV_* hardware calls removed.
- * Every GCM call uses wc_AesGcmSetKey / wc_AesGcmEncrypt / wc_AesGcmDecrypt.
- * The Aes context is stack-allocated, freed with wc_AesFree(), and zeroed
- * with secure_zero() on every path.  No global AES state persists.
+ * AES-256-GCM: MSPM0L2228 AESADV hardware peripheral, CPU-polling mode.
+ * HMAC-SHA256:  wolfcrypt (hardware has no HMAC accelerator).
  *
- * Include order:  wolfssl headers come first so that wolfssl/wolfcrypt/settings.h
- * sees our CFLAGS defines (HAVE_AES_GCM, WC_AES_BITSLICED, WC_NO_RNG, …)
- * before any conditional compilation in aes.h resolves.  Placing our own
- * headers first caused the GCM function prototypes to be conditionally
- * excluded because settings.h had not yet been processed.
+ * AESADV GCM mode: DL_AESADV_MODE_GCM_AUTONOMOUS.
+ *   The hardware derives the GHASH subkey H = AES_K(0) and computes
+ *   Y0-encrypted internally, so no separate ECB pass is required.
+ *   Key is loaded once per call, then the peripheral is reset to clear
+ *   key registers before returning — limits exposure in hardware registers.
  *
- * SCA countermeasures — two layers:
+ * IV layout for a 96-bit nonce (standard GCM J0):
+ *   iv[0..11]  = nonce (copied from caller)
+ *   iv[12..14] = 0x00
+ *   iv[15]     = 0x01  ← counter = 1 (big-endian byte order)
+ *   The ARM reads iv[12..15] as a little-endian uint32, giving IV3 = 0x01000000.
+ *   The TRM note "upper word iv[127:96] must be 0x01000000" refers to this value.
  *
- *   Layer 1  WC_AES_BITSLICED (build flag in Makefile)
- *     Wolfcrypt's table-free bitsliced AES.  All SubBytes operations are
- *     computed with pure bitwise logic — no S-box table lookups exist.
- *     Eliminates data-dependent memory access patterns (root cause of
- *     cache-DPA / SPA on table-based AES).  Requires HAVE_AES_ECB.
+ * Data path (CPU polling, DMA disabled):
+ *   For each 16-byte block, poll isInputReady() then write 4 words.
+ *   AAD blocks: no output read.
+ *   Crypto blocks: after writing, poll isOutputReady() then read 4 words.
+ *   Partial last block: zero-padded on input; only valid bytes copied from output.
+ *   After all data: poll isSavedOutputContextReady(), read 16-byte TAG.
  *
- *   Layer 2  random_delay() (before wc_AesGcmSetKey)
- *     Two TRNG bytes produce a 0–~20 ms jitter window.  CPA requires
- *     traces aligned to within a few samples; ±640 k sample positions of
- *     uncertainty forces an attacker to collect proportionally more traces
- *     or find a stable resynchronisation feature — which does not exist in
- *     bitsliced AES's flat power profile.
+ * SCA: random_delay() before key load; peripheral reset clears key registers.
+ *
+ * Include order: wolfssl headers first so settings.h resolves CFLAGS defines
+ * before hmac.h applies its conditional guards.
  *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 
-/*
- * wolfssl headers first — settings.h must resolve CFLAGS defines
- * (HAVE_AES_GCM, WC_AES_BITSLICED, WC_NO_RNG, …) before aes.h and hmac.h
- * apply their conditional guards.
- */
 #include <wolfssl/wolfcrypt/settings.h>
-#include <wolfssl/wolfcrypt/aes.h>
 #include <wolfssl/wolfcrypt/hmac.h>
 
+#include "ti/driverlib/dl_aesadv.h"
 #include "crypto.h"
 #include "security.h"
 #include "secrets.h"
@@ -48,17 +45,273 @@
 
 
 /* -----------------------------------------------------------------------
- * crypto_init — no-op, retained for API compatibility.
+ * AESADV constants
+ * ---------------------------------------------------------------------- */
+#define AES_BLOCK_WORDS     4U          /* 128-bit block = 4 × uint32_t       */
+#define AES_BLOCK_BYTES     16U         /* 128-bit block = 16 bytes            */
+
+/*
+ * Poll budget per block: AES-256 takes ~81 cycles (~2.5 µs at 32 MHz).
+ * 100 000 iterations ≈ 3 ms at -O0 — far above any real hardware latency.
+ * security_halt() fires on timeout to prevent silent hangs.
+ */
+#define AESADV_POLL_LIMIT   100000U
+
+
+/* -----------------------------------------------------------------------
+ * aesadv_reset_and_enable — power-enable then hardware-reset AESADV.
+ *
+ * The reset clears key registers. Calling this before each operation
+ * guarantees a clean slate regardless of prior state.
+ * ---------------------------------------------------------------------- */
+static void aesadv_reset_and_enable(void)
+{
+    /* Power enable (idempotent if already on). No settle delay required —
+     * AESADV is a fully digital peripheral; register writes take immediate
+     * effect unlike the TRNG analog blocks that need 32 k cycles. */
+    AESADV->GPRCM.PWREN =
+        (AESADV_PWREN_KEY_UNLOCK_W | AESADV_PWREN_ENABLE_ENABLE);
+
+    /* Hardware reset — clears CTRL, key registers, IV, TAG, DMA_HS. */
+    DL_AESADV_reset(AESADV);
+}
+
+
+/* -----------------------------------------------------------------------
+ * poll_input_ready — wait until AESADV input buffer is empty.
+ * Loop counter poll_i in [0, AESADV_POLL_LIMIT); halts on timeout.
+ * ---------------------------------------------------------------------- */
+static void poll_input_ready(void)
+{
+    uint32_t poll_i;
+    for (poll_i = 0U;
+         !DL_AESADV_isInputReady(AESADV) && poll_i < AESADV_POLL_LIMIT;
+         poll_i++) {}
+
+    if (poll_i >= AESADV_POLL_LIMIT) {
+        security_halt();
+    }
+}
+
+
+/* -----------------------------------------------------------------------
+ * poll_output_ready — wait until AESADV output block is available.
+ * Loop counter poll_i in [0, AESADV_POLL_LIMIT); halts on timeout.
+ * ---------------------------------------------------------------------- */
+static void poll_output_ready(void)
+{
+    uint32_t poll_i;
+    for (poll_i = 0U;
+         !DL_AESADV_isOutputReady(AESADV) && poll_i < AESADV_POLL_LIMIT;
+         poll_i++) {}
+
+    if (poll_i >= AESADV_POLL_LIMIT) {
+        security_halt();
+    }
+}
+
+
+/* -----------------------------------------------------------------------
+ * poll_tag_ready — wait until saved output context (TAG) is available.
+ * Loop counter poll_i in [0, AESADV_POLL_LIMIT); halts on timeout.
+ * ---------------------------------------------------------------------- */
+static void poll_tag_ready(void)
+{
+    uint32_t poll_i;
+    for (poll_i = 0U;
+         !DL_AESADV_isSavedOutputContextReady(AESADV) &&
+         poll_i < AESADV_POLL_LIMIT;
+         poll_i++) {}
+
+    if (poll_i >= AESADV_POLL_LIMIT) {
+        security_halt();
+    }
+}
+
+
+/* -----------------------------------------------------------------------
+ * feed_aad_blocks — push all AAD to AESADV; no output is produced.
+ *
+ * AAD must be fed in 16-byte blocks; the last block is zero-padded.
+ * The hardware uses the aadLength set in initGCM to know where AAD ends.
+ *
+ * Loop counter blk_i in [0, num_blks); terminates exactly at num_blks.
+ * ---------------------------------------------------------------------- */
+static void feed_aad_blocks(const uint8_t *aad, size_t aad_len)
+{
+    uint32_t in_block[AES_BLOCK_WORDS];
+    size_t   num_blks;
+    size_t   blk_i;
+    size_t   byte_off;
+    size_t   copy_bytes;
+
+    if (aad_len == 0U) {
+        return;
+    }
+
+    num_blks = (aad_len + AES_BLOCK_BYTES - 1U) / AES_BLOCK_BYTES;
+
+    for (blk_i = 0U; blk_i < num_blks; blk_i++) {
+        byte_off   = blk_i * AES_BLOCK_BYTES;
+        copy_bytes = aad_len - byte_off;
+        if (copy_bytes > AES_BLOCK_BYTES) {
+            copy_bytes = AES_BLOCK_BYTES;
+        }
+
+        /* Zero-pad the block, then copy valid AAD bytes. */
+        memset(in_block, 0, sizeof(in_block));
+        memcpy(in_block, aad + byte_off, copy_bytes);
+
+        poll_input_ready();
+        DL_AESADV_loadInputDataAligned(AESADV, in_block);
+        /* No output read for AAD blocks. */
+    }
+
+    /* Clear local copy of AAD data. */
+    secure_zero(in_block, sizeof(in_block));
+}
+
+
+/* -----------------------------------------------------------------------
+ * feed_crypto_blocks — push plaintext/ciphertext, collect output.
+ *
+ * Each 16-byte input block is written; the corresponding 16-byte output
+ * block is read back.  The partial last block is zero-padded on input;
+ * only the first (data_len % 16) bytes of the output are valid and copied.
+ *
+ * Loop counter blk_i in [0, num_blks); terminates exactly at num_blks.
+ * ---------------------------------------------------------------------- */
+static void feed_crypto_blocks(const uint8_t *input, uint8_t *output,
+                                size_t data_len)
+{
+    uint32_t in_block[AES_BLOCK_WORDS];
+    uint32_t out_block[AES_BLOCK_WORDS];
+    size_t   num_blks;
+    size_t   blk_i;
+    size_t   byte_off;
+    size_t   copy_bytes;
+
+    if (data_len == 0U) {
+        return;
+    }
+
+    num_blks = (data_len + AES_BLOCK_BYTES - 1U) / AES_BLOCK_BYTES;
+
+    for (blk_i = 0U; blk_i < num_blks; blk_i++) {
+        byte_off   = blk_i * AES_BLOCK_BYTES;
+        copy_bytes = data_len - byte_off;
+        if (copy_bytes > AES_BLOCK_BYTES) {
+            copy_bytes = AES_BLOCK_BYTES;
+        }
+
+        /* Build zero-padded input block. */
+        memset(in_block, 0, sizeof(in_block));
+        memcpy(in_block, input + byte_off, copy_bytes);
+
+        poll_input_ready();
+        DL_AESADV_loadInputDataAligned(AESADV, in_block);
+
+        poll_output_ready();
+        DL_AESADV_readOutputDataAligned(AESADV, out_block);
+
+        /* Copy only the valid output bytes (guards against partial last block). */
+        memcpy(output + byte_off, out_block, copy_bytes);
+    }
+
+    secure_zero(in_block,  sizeof(in_block));
+    secure_zero(out_block, sizeof(out_block));
+}
+
+
+/* -----------------------------------------------------------------------
+ * aesadv_gcm_run — shared setup and teardown for encrypt and decrypt.
+ *
+ * Sets key, configures GCM mode, feeds AAD + data, reads TAG.
+ * On return: out_buf holds ciphertext or plaintext; tag_out holds the
+ * hardware-computed 16-byte authentication tag.
+ *
+ * Returns 0 on success, -1 on any setup failure (tag comparison is the
+ * caller's responsibility for decryption).
+ * ---------------------------------------------------------------------- */
+static int aesadv_gcm_run(DL_AESADV_DIR    direction,
+                          const uint8_t   *key,
+                          const uint8_t   *nonce,
+                          const uint8_t   *aad,      size_t aad_len,
+                          const uint8_t   *in_buf,   size_t data_len,
+                          uint8_t         *out_buf,
+                          uint8_t         *tag_out)
+{
+    /* Aligned local copies — STORAGE_KEY alignment is not guaranteed. */
+    uint32_t key_buf[8];                    /* AES-256: 8 × uint32_t = 32 B  */
+    uint32_t iv_buf[AES_BLOCK_WORDS];       /* 128-bit IV                     */
+    uint32_t tag_buf[AES_BLOCK_WORDS];      /* 128-bit TAG output             */
+    uint8_t *iv_bytes = (uint8_t *)iv_buf;
+
+    DL_AESADV_Config cfg;
+
+    /* --- Build GCM IV = nonce || counter=1 (standard J0) --- */
+    memset(iv_buf, 0, sizeof(iv_buf));
+    memcpy(iv_bytes, nonce, NONCE_SIZE);    /* bytes [0..11]  */
+    iv_bytes[15] = 0x01U;                  /* byte  [15]: counter = 1 big-endian;
+                                              ARM loads iv[12..15] as uint32
+                                              IV3 = 0x01000000 (LE), per TRM */
+
+    /* --- Power-enable and reset (clears previous key/state) --- */
+    aesadv_reset_and_enable();
+
+    /* --- Disable DMA; use CPU register polling --- */
+    DL_AESADV_disableDMAOperation(AESADV);
+
+    /* --- Load 256-bit key into aligned buffer then into hardware --- */
+    memcpy(key_buf, key, GCM_KEY_SIZE);
+    DL_AESADV_setKeyAligned(AESADV, key_buf, DL_AESADV_KEY_SIZE_256_BIT);
+    secure_zero(key_buf, sizeof(key_buf));  /* key off stack immediately */
+
+    /* --- Configure GCM autonomous mode --- */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode              = DL_AESADV_MODE_GCM_AUTONOMOUS;
+    cfg.direction         = direction;
+    cfg.iv                = iv_bytes;             /* 4-byte aligned uint32_t[] */
+    cfg.lowerCryptoLength = (uint32_t)data_len;
+    cfg.upperCryptoLength = 0U;
+    cfg.aadLength         = (uint32_t)aad_len;
+
+    DL_AESADV_initGCM(AESADV, &cfg);
+
+    /* --- Feed AAD (auth-only, no ciphertext produced) --- */
+    feed_aad_blocks(aad, aad_len);
+
+    /* --- Feed crypto data and collect output --- */
+    feed_crypto_blocks(in_buf, out_buf, data_len);
+
+    /* --- Read authentication TAG --- */
+    poll_tag_ready();
+    DL_AESADV_readTAGAligned(AESADV, tag_buf);
+    memcpy(tag_out, tag_buf, TAG_SIZE);
+
+    /* --- Reset peripheral to clear key from hardware registers --- */
+    aesadv_reset_and_enable();
+
+    secure_zero(iv_buf,  sizeof(iv_buf));
+    secure_zero(tag_buf, sizeof(tag_buf));
+
+    return 0;
+}
+
+
+/* -----------------------------------------------------------------------
+ * crypto_init — power-enable AESADV; wolfcrypt needs no init.
  * ---------------------------------------------------------------------- */
 int crypto_init(void)
 {
+    aesadv_reset_and_enable();
     return 0;
 }
 
 
 /* -----------------------------------------------------------------------
  * generate_nonce — fill nonce_out with NONCE_SIZE TRNG bytes.
- * Loop counter i terminates at NONCE_SIZE exactly.
+ * Loop counter i in [0, NONCE_SIZE); terminates at NONCE_SIZE exactly.
  * ---------------------------------------------------------------------- */
 int generate_nonce(uint8_t *nonce_out)
 {
@@ -66,7 +319,7 @@ int generate_nonce(uint8_t *nonce_out)
 
     if (nonce_out == NULL) { return -1; }
 
-    for (i = 0; i < NONCE_SIZE; i++) {
+    for (i = 0U; i < NONCE_SIZE; i++) {
         nonce_out[i] = trng_read_byte();
     }
     return 0;
@@ -74,11 +327,10 @@ int generate_nonce(uint8_t *nonce_out)
 
 
 /* -----------------------------------------------------------------------
- * aes_gcm_encrypt — AES-256-GCM encryption via wolfcrypt.
+ * aes_gcm_encrypt — AES-256-GCM encryption via AESADV hardware.
  *
- * SCA Layer 2: random_delay() before wc_AesGcmSetKey slides the
- * key-schedule power signature across a ~20 ms trace window.
- * SCA Layer 1: WC_AES_BITSLICED build flag eliminates table-lookup leakage.
+ * SCA: random_delay() before key load slides the key-schedule power
+ * signature across a ~20 ms trace window.
  * ---------------------------------------------------------------------- */
 int aes_gcm_encrypt(const uint8_t *key,
                     const uint8_t *nonce,
@@ -87,9 +339,6 @@ int aes_gcm_encrypt(const uint8_t *key,
                     uint8_t       *ciphertext,
                     uint8_t       *tag)
 {
-    Aes ctx;
-    int ret;
-
     if (key == NULL || nonce == NULL || ciphertext == NULL || tag == NULL) {
         return -1;
     }
@@ -97,34 +346,22 @@ int aes_gcm_encrypt(const uint8_t *key,
         return -1;
     }
 
-    random_delay();   /* SCA Layer 2 */
+    random_delay();   /* SCA jitter before key enters hardware */
 
-    ret = wc_AesGcmSetKey(&ctx, key, GCM_KEY_SIZE);
-    if (ret != 0) {
-        wc_AesFree(&ctx);
-        secure_zero(&ctx, sizeof(Aes));
-        return -1;
-    }
-
-    ret = wc_AesGcmEncrypt(&ctx,
-                           ciphertext, plaintext, (word32)pt_len,
-                           nonce,      NONCE_SIZE,
-                           tag,        TAG_SIZE,
-                           aad,        (word32)aad_len);
-
-    wc_AesFree(&ctx);
-    secure_zero(&ctx, sizeof(Aes));
-
-    return (ret == 0) ? 0 : -1;
+    return aesadv_gcm_run(DL_AESADV_DIR_ENCRYPT,
+                          key, nonce,
+                          aad, aad_len,
+                          plaintext, pt_len,
+                          ciphertext, tag);
 }
 
 
 /* -----------------------------------------------------------------------
- * aes_gcm_decrypt — AES-256-GCM decryption via wolfcrypt.
+ * aes_gcm_decrypt — AES-256-GCM decryption via AESADV hardware.
  *
- * wc_AesGcmDecrypt returns AES_GCM_AUTH_E on tag failure but still writes
- * to the output buffer.  On non-zero return the plaintext buffer is zeroed
- * before returning -1 — no partial plaintext leaks to the caller.
+ * The hardware computes a tag over the ciphertext; we compare it with the
+ * expected tag using secure_compare() (constant-time, no early exit).
+ * Plaintext is zeroed on any failure — no partial plaintext leaks.
  * ---------------------------------------------------------------------- */
 int aes_gcm_decrypt(const uint8_t *key,
                     const uint8_t *nonce,
@@ -133,8 +370,8 @@ int aes_gcm_decrypt(const uint8_t *key,
                     const uint8_t *tag,
                     uint8_t       *plaintext)
 {
-    Aes ctx;
-    int ret;
+    uint8_t computed_tag[TAG_SIZE];
+    int     ret;
 
     if (key == NULL || nonce == NULL || tag == NULL || plaintext == NULL) {
         return -1;
@@ -143,36 +380,35 @@ int aes_gcm_decrypt(const uint8_t *key,
         return -1;
     }
 
-    random_delay();   /* SCA Layer 2 */
+    random_delay();   /* SCA jitter before key enters hardware */
 
-    ret = wc_AesGcmSetKey(&ctx, key, GCM_KEY_SIZE);
+    ret = aesadv_gcm_run(DL_AESADV_DIR_DECRYPT,
+                         key, nonce,
+                         aad, aad_len,
+                         ciphertext, ct_len,
+                         plaintext, computed_tag);
     if (ret != 0) {
-        wc_AesFree(&ctx);
-        secure_zero(&ctx, sizeof(Aes));
+        secure_zero(plaintext,    ct_len);
+        secure_zero(computed_tag, sizeof(computed_tag));
         return -1;
     }
 
-    ret = wc_AesGcmDecrypt(&ctx,
-                           plaintext, ciphertext, (word32)ct_len,
-                           nonce,     NONCE_SIZE,
-                           tag,       TAG_SIZE,
-                           aad,       (word32)aad_len);
-
-    wc_AesFree(&ctx);
-    secure_zero(&ctx, sizeof(Aes));
-
-    if (ret != 0) {
-        secure_zero(plaintext, ct_len);   /* don't leak partial plaintext */
+    /* Constant-time tag comparison — must not short-circuit. */
+    if (!secure_compare(computed_tag, tag, TAG_SIZE)) {
+        secure_zero(plaintext,    ct_len);
+        secure_zero(computed_tag, sizeof(computed_tag));
         return -1;
     }
+
+    secure_zero(computed_tag, sizeof(computed_tag));
     return 0;
 }
 
 
 /* -----------------------------------------------------------------------
- * hmac_sha256 — HMAC-SHA256 with mandatory domain separator.
+ * hmac_sha256 — HMAC-SHA256 with mandatory domain separator (wolfcrypt).
  *
- * Computes HMAC(key, data || domain) using two wc_HmacUpdate calls so no
+ * Computes HMAC(key, data || domain) via two wc_HmacUpdate calls so no
  * temporary concatenation buffer is needed on the stack.
  * ---------------------------------------------------------------------- */
 int hmac_sha256(const uint8_t *key,
@@ -266,20 +502,20 @@ size_t build_storage_aad(uint8_t slot, const uint8_t *uuid,
                          uint8_t *out)
 {
     uint8_t i;
-    uint8_t pos = 0;
+    uint8_t pos = 0U;
 
     out[pos++] = slot;
 
     /* uuid — loop counter i in [0, 16) */
-    for (i = 0; i < 16; i++) { out[pos++] = uuid[i]; }
+    for (i = 0U; i < 16U; i++) { out[pos++] = uuid[i]; }
 
     /* group_id little-endian */
-    out[pos++] = (uint8_t)(group_id & 0xFF);
-    out[pos++] = (uint8_t)((group_id >> 8) & 0xFF);
+    out[pos++] = (uint8_t)(group_id & 0xFFU);
+    out[pos++] = (uint8_t)((group_id >> 8) & 0xFFU);
 
     /* name zero-padded — loop counter i in [0, 32) */
-    for (i = 0; i < 32; i++) {
-        out[pos++] = (name != NULL && name[i] != '\0') ? (uint8_t)name[i] : 0;
+    for (i = 0U; i < 32U; i++) {
+        out[pos++] = (name != NULL && name[i] != '\0') ? (uint8_t)name[i] : 0U;
     }
 
     return STORAGE_AAD_SIZE;   /* 51 */
@@ -300,26 +536,26 @@ size_t build_transfer_aad(const uint8_t *recv_chal,
                           uint8_t       *out)
 {
     uint8_t i;
-    uint8_t pos = 0;
+    uint8_t pos = 0U;
 
     /* recv_chal — loop counter i in [0, 12) */
-    for (i = 0; i < 12; i++) { out[pos++] = recv_chal[i]; }
+    for (i = 0U; i < 12U; i++) { out[pos++] = recv_chal[i]; }
 
     /* send_chal — loop counter i in [0, 12) */
-    for (i = 0; i < 12; i++) { out[pos++] = send_chal[i]; }
+    for (i = 0U; i < 12U; i++) { out[pos++] = send_chal[i]; }
 
     out[pos++] = slot;
 
     /* uuid — loop counter i in [0, 16) */
-    for (i = 0; i < 16; i++) { out[pos++] = uuid[i]; }
+    for (i = 0U; i < 16U; i++) { out[pos++] = uuid[i]; }
 
     /* group_id little-endian */
-    out[pos++] = (uint8_t)(group_id & 0xFF);
-    out[pos++] = (uint8_t)((group_id >> 8) & 0xFF);
+    out[pos++] = (uint8_t)(group_id & 0xFFU);
+    out[pos++] = (uint8_t)((group_id >> 8) & 0xFFU);
 
     /* name zero-padded — loop counter i in [0, 32) */
-    for (i = 0; i < 32; i++) {
-        out[pos++] = (name != NULL && name[i] != '\0') ? (uint8_t)name[i] : 0;
+    for (i = 0U; i < 32U; i++) {
+        out[pos++] = (name != NULL && name[i] != '\0') ? (uint8_t)name[i] : 0U;
     }
 
     return TRANSFER_AAD_SIZE;  /* 75 */
