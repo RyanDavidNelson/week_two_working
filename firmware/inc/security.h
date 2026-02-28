@@ -27,29 +27,37 @@
 /* ------------------------------------------------------------------ */
 
 typedef enum {
-    PERM_READ  = 0,
-    PERM_WRITE = 1,
+    PERM_READ    = 0,
+    PERM_WRITE   = 1,
+    PERM_RECEIVE = 2,
 } permission_enum_t;
 
-#define MAX_PERM_COUNT  8
+/* Maximum number of permission entries in the table. */
+#define MAX_PERMS       8
 
+/*
+ * One permission entry: boolean flags per operation.
+ * Wire format: group_id(2 LE) || read(1) || write(1) || receive(1).
+ * Must match secrets_to_c_header.py serialization.
+ */
 typedef struct {
     uint16_t group_id;
-    uint8_t  perm;
-} permission_entry_t;
+    bool     read;
+    bool     write;
+    bool     receive;
+} group_permission_t;
 
-/* Populated by commands.c at boot from the stored permission table. */
-extern permission_entry_t global_permissions[];
-extern int                global_perm_count;
+/* Populated at boot from the stored permission table in secrets.c. */
+extern const group_permission_t global_permissions[MAX_PERMS];
+extern int                      global_perm_count;
 
 /* ------------------------------------------------------------------ */
 /* Slot / Name / Content Constants                                     */
 /* ------------------------------------------------------------------ */
 
 #define NUM_SLOTS           8
-#define MAX_NAME_SIZE       64
-#define MAX_CONTENTS_SIZE   2048
-#define MAX_PERM_LIST       8
+#define MAX_NAME_SIZE       32
+#define MAX_CONTENTS_SIZE   8192
 #define PIN_LENGTH          6
 
 /* ------------------------------------------------------------------ */
@@ -61,9 +69,6 @@ extern int                global_perm_count;
  *
  * Evaluates expr twice into ok1 and ok2.  If the two volatile results
  * differ, a fault injection is assumed and security_halt() is called.
- * Halts device on disagreement (single fault injection still caught).
- *
- * random_delay() removed for same reasons as SECURE_PIN_CHECK.
  */
 #define SECURE_BOOL_CHECK(ok1, ok2, expr)           \
     do {                                             \
@@ -72,6 +77,19 @@ extern int                global_perm_count;
         if ((bool)(ok1) != (bool)(ok2)) {           \
             security_halt();                         \
         }                                            \
+    } while (0)
+
+/**
+ * @brief Double-evaluate check_pin() and halt on disagreement.
+ *        Zeroing of pin buffer is handled inside check_pin().
+ */
+#define SECURE_PIN_CHECK(ok1, ok2, pin_buf)                     \
+    do {                                                         \
+        (ok1) = check_pin((unsigned char *)(pin_buf));          \
+        (ok2) = check_pin_cmp((const unsigned char *)(pin_buf));\
+        if ((bool)(ok1) != (bool)(ok2)) {                       \
+            security_halt();                                     \
+        }                                                        \
     } while (0)
 
 /* ------------------------------------------------------------------ */
@@ -88,10 +106,7 @@ void delay_ms(uint32_t ms);
  * @brief Random jitter: 0–~20 ms from two TRNG bytes.
  *
  * Called in crypto.c before every wc_AesGcmSetKey() to slide the
- * key-schedule power signature across a ~20 ms trace window.  CPA
- * requires traces aligned to within a few samples; ±640 k sample
- * positions of uncertainty forces proportionally more traces.
- * Also available for any other hot path that needs SCA desync.
+ * key-schedule power signature across a ~20 ms trace window.
  */
 void random_delay(void);
 
@@ -152,11 +167,12 @@ bool validate_slot(uint8_t slot);
  *  within max_len bytes. */
 bool validate_name(const char *name, size_t max_len);
 
-/** Returns true iff count is in [0, MAX_PERM_COUNT]. */
+/** Returns true iff count is in [0, MAX_PERMS]. */
 bool validate_perm_count(int count);
 
 /**
  * @brief Double-pass scan of global_permissions[] for (group_id, perm).
+ *        Checks the read/write/receive boolean field corresponding to perm.
  *        Halts if the two passes disagree (fault injection defence).
  */
 bool validate_permission(uint16_t group_id, permission_enum_t perm);

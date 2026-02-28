@@ -21,6 +21,9 @@
 /* Hard cap on TRNG busy-wait iterations; security_halt() if exceeded. */
 #define TRNG_POLL_LIMIT 1000000UL
 
+/* Runtime permission count; initialised at boot from PERM_COUNT. */
+int global_perm_count = PERM_COUNT;
+
 /* ------------------------------------------------------------------ */
 /* Timing Functions                                                    */
 /* ------------------------------------------------------------------ */
@@ -57,9 +60,7 @@ void delay_ms(uint32_t ms)
 void random_delay(void)
 {
     /* 0–~20 ms SCA desync jitter.
-     * Two TRNG bytes → 16-bit value; range ~0–640 k cycles ≈ 0–20 ms.
-     * Wider window means CPA requires proportionally more traces to
-     * average out the key-schedule power signature. */
+     * Two TRNG bytes → 16-bit value; range ~0–640 k cycles ≈ 0–20 ms. */
     uint32_t lo     = (uint32_t)trng_read_byte();
     uint32_t hi     = (uint32_t)trng_read_byte();
     uint32_t jitter = ((hi << 8) | lo) * (CYCLES_PER_MS / 3277);
@@ -99,38 +100,53 @@ void security_halt(void)
 
 int trng_init(void)
 {
-    uint32_t poll = 0;
+    uint32_t poll;
 
-    DL_TRNG_reset(TRNG);
-    DL_TRNG_enable(TRNG);
-
-    /* Wait for TRNG to be ready; halt if self-test never completes. */
-    while (DL_TRNG_getClockDivider(TRNG) == 0) {
-        if (++poll >= TRNG_POLL_LIMIT) {
-            security_halt();
+    DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_TEST_DIG);
+    for (poll = 0; poll < TRNG_POLL_LIMIT; poll++) {
+        if (DL_TRNG_getInterruptStatus(TRNG) &
+            DL_TRNG_INTERRUPT_CMD_DONE_EVENT) {
+            break;
         }
     }
+    if (poll >= TRNG_POLL_LIMIT) { security_halt(); }
+    DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CMD_DONE_EVENT);
+
+    DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_TEST_ANA);
+    for (poll = 0; poll < TRNG_POLL_LIMIT; poll++) {
+        if (DL_TRNG_getInterruptStatus(TRNG) &
+            DL_TRNG_INTERRUPT_CMD_DONE_EVENT) {
+            break;
+        }
+    }
+    if (poll >= TRNG_POLL_LIMIT) { security_halt(); }
+    DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CMD_DONE_EVENT);
+
+    DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
     return 0;
 }
 
 uint32_t trng_read_word(void)
 {
-    uint32_t poll = 0;
+    uint32_t poll;
 
-    DL_TRNG_generateData(TRNG);
-
-    while (DL_TRNG_getStatus(TRNG) != DL_TRNG_STATUS_DATA_READY) {
-        if (++poll >= TRNG_POLL_LIMIT) {
-            security_halt();
+    DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
+    for (poll = 0; poll < TRNG_POLL_LIMIT; poll++) {
+        if (DL_TRNG_getInterruptStatus(TRNG) &
+            DL_TRNG_INTERRUPT_CAPTURE_RDY_EVENT) {
+            break;
         }
     }
-    return DL_TRNG_getData(TRNG);
+    if (poll >= TRNG_POLL_LIMIT) { security_halt(); }
+
+    uint32_t word = DL_TRNG_getCapture(TRNG);
+    DL_TRNG_clearInterruptStatus(TRNG, DL_TRNG_INTERRUPT_CAPTURE_RDY_EVENT);
+    return word;
 }
 
 uint8_t trng_read_byte(void)
 {
-    /* Low byte of a fresh 32-bit word. */
-    return (uint8_t)(trng_read_word() & 0xFFU);
+    return (uint8_t)(trng_read_word() & 0xFF);
 }
 
 /* ------------------------------------------------------------------ */
@@ -139,28 +155,15 @@ uint8_t trng_read_byte(void)
 
 bool secure_compare(const uint8_t *a, const uint8_t *b, size_t len)
 {
-    const uint8_t *pa  = (const uint8_t *)a;
-    const uint8_t *pb  = (const uint8_t *)b;
-    volatile uint8_t acc = 0;
+    volatile uint8_t diff = 0;
     size_t i;
-    /* Loop counter i in [0, len); constant-time for all inputs. */
+    /* Loop counter i in [0, len); no early exit — constant time. */
     for (i = 0; i < len; i++) {
-        acc |= pa[i] ^ pb[i];
+        diff |= a[i] ^ b[i];
     }
-
-    return (acc == 0);
+    return (diff == 0);
 }
 
-/*
- * check_pin_cmp — single-pass HMAC-based PIN check, no brute-force penalty.
- *
- * Receives the PIN as PIN_LENGTH ASCII hex bytes exactly as the host sent
- * them (e.g. "1a2b3c").  Computes HMAC(PIN_KEY, pin || "pin") and
- * constant-time compares with PIN_HMAC stored in secrets.c.
- *
- * Never call this directly from a command handler — always use check_pin(),
- * which double-evaluates and applies the 5-second failure penalty.
- */
 bool check_pin_cmp(const unsigned char *pin)
 {
     uint8_t computed[HMAC_SIZE];
@@ -182,13 +185,10 @@ bool check_pin_cmp(const unsigned char *pin)
 }
 
 /*
- * check_pin — double-pass check_pin_cmp with no random delay between passes.
+ * check_pin — double-pass check_pin_cmp with 5-second penalty on failure.
  *
- * The double-pass catches any single fault injection that flips the result of
- * one evaluation; both passes must agree or we halt.  random_delay() between
- * passes is not needed because double-glitch attacks are out of scope.
- *
- * Applies 5-second penalty on wrong PIN; zeros pin buffer on every exit path.
+ * Both passes must agree or security_halt() fires (fault injection defence).
+ * Zeroes pin buffer on every exit path.
  */
 bool check_pin(unsigned char *pin)
 {
@@ -196,7 +196,7 @@ bool check_pin(unsigned char *pin)
     volatile bool r2;
 
     r1 = check_pin_cmp(pin);
-    r2 = check_pin_cmp(pin);   /* no random_delay — double-glitch out of scope */
+    r2 = check_pin_cmp(pin);
 
     secure_zero(pin, PIN_LENGTH);
 
@@ -215,13 +215,13 @@ bool check_pin(unsigned char *pin)
 /*
  * validate_permission — double-pass local permission check.
  *
- * Scans global_permissions[] twice without random_delay between passes.
- * A single fault injection that flips found_pass1 but not found_pass2 (or
- * vice-versa) is caught by the agreement check; security_halt() fires.
- * random_delay() removed — double-glitch is out of scope.
+ * Selects the read/write/receive boolean field of group_permission_t
+ * based on the permission_enum_t argument, then scans global_permissions[]
+ * twice.  A single fault injection that flips one pass but not the other
+ * is caught by the agreement check; security_halt() fires.
  *
- * Loop counter i in [0, PERM_COUNT); terminates when i == PERM_COUNT.
- * Loop counter j in [0, PERM_COUNT); terminates when j == PERM_COUNT.
+ * Loop counter i in [0, global_perm_count); terminates when i == global_perm_count.
+ * Loop counter j in [0, global_perm_count); terminates when j == global_perm_count.
  */
 bool validate_permission(uint16_t group_id, permission_enum_t perm)
 {
@@ -231,18 +231,24 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
 
     /* First pass. */
     for (i = 0; i < global_perm_count; i++) {
-        if (global_permissions[i].group_id == group_id &&
-            global_permissions[i].perm     == (uint8_t)perm) {
-            found_pass1 = true;
-        }
+        if (global_permissions[i].group_id != group_id) { continue; }
+        bool granted;
+        if      (perm == PERM_READ)    { granted = global_permissions[i].read;    }
+        else if (perm == PERM_WRITE)   { granted = global_permissions[i].write;   }
+        else if (perm == PERM_RECEIVE) { granted = global_permissions[i].receive; }
+        else                           { granted = false; }
+        if (granted) { found_pass1 = true; }
     }
 
-    /* Second pass. */
+    /* Second pass — identical logic; disagreement implies fault injection. */
     for (j = 0; j < global_perm_count; j++) {
-        if (global_permissions[j].group_id == group_id &&
-            global_permissions[j].perm     == (uint8_t)perm) {
-            found_pass2 = true;
-        }
+        if (global_permissions[j].group_id != group_id) { continue; }
+        bool granted;
+        if      (perm == PERM_READ)    { granted = global_permissions[j].read;    }
+        else if (perm == PERM_WRITE)   { granted = global_permissions[j].write;   }
+        else if (perm == PERM_RECEIVE) { granted = global_permissions[j].receive; }
+        else                           { granted = false; }
+        if (granted) { found_pass2 = true; }
     }
 
     if ((bool)found_pass1 != (bool)found_pass2) {
@@ -280,5 +286,5 @@ bool validate_name(const char *name, size_t max_len)
 
 bool validate_perm_count(int count)
 {
-    return (count >= 0 && count <= MAX_PERM_COUNT);
+    return (count >= 0 && count <= MAX_PERMS);
 }
