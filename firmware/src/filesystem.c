@@ -15,6 +15,9 @@
  * read_file_group_id() reads only 23 header bytes to recover group_id without
  *   placing a full 8 KB file_t on the stack.
  *
+ * read_file_header() reads only 55 header bytes (through name) for the
+ *   LSN-INT filter loop — avoids placing an 8277-byte file_t on the stack.
+ *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 
@@ -136,6 +139,49 @@ int read_file_group_id(slot_t slot, uint16_t *out_group_id)
 
     /* group_id lives at byte offset 21 (4 + 1 + 16) in the packed struct. */
     memcpy(out_group_id, header + 21, sizeof(uint16_t));
+    return 0;
+}
+
+/*
+ * Read the 55-byte packed header (in_use through name) without allocating a
+ * full file_t on the stack.
+ *
+ * Packed offsets inside file_t (verified against #pragma pack(1)):
+ *   [0..3]   in_use   (4 B, uint32_t)
+ *   [4]      slot     (1 B, uint8_t)
+ *   [5..20]  uuid     (16 B, uint8_t[16])
+ *   [21..22] group_id (2 B, uint16_t, LE)
+ *   [23..54] name     (32 B, char[32])
+ *
+ * Used by the LSN-INT filter loop to avoid placing an 8277-byte file_t on the
+ * stack while ir2/resp_list/hmac_input are already live.
+ */
+int read_file_header(slot_t slot, file_header_t *out)
+{
+    uint8_t  raw[FILE_HEADER_SIZE]; /* in_use(4)+slot(1)+uuid(16)+group_id(2)+name(32) */
+    uint32_t faddr;
+    uint32_t in_use_val;
+
+    if (!validate_slot(slot) || out == NULL) {
+        return -1;
+    }
+
+    faddr = FILE_START_PAGE_FROM_SLOT(slot);
+    flash_simple_read(faddr, raw, sizeof(raw));
+
+    /* Check sentinel before trusting any other field. */
+    memcpy(&in_use_val, raw, sizeof(uint32_t));
+    if (in_use_val != FILE_IN_USE) {
+        return -1;
+    }
+
+    /* Unpack raw bytes into file_header_t fields. */
+    out->in_use = in_use_val;
+    out->slot   = raw[4];
+    memcpy(out->uuid,      raw + 5,  UUID_SIZE);
+    memcpy(&out->group_id, raw + 21, sizeof(uint16_t));
+    memcpy(out->name,      raw + 23, MAX_NAME_SIZE);
+    out->name[MAX_NAME_SIZE - 1] = '\0';
     return 0;
 }
 
