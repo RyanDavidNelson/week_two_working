@@ -3,79 +3,64 @@
  * @brief Security primitives for eCTF HSM
  * @date 2026
  *
+ * This source file is part of an example system for MITRE's 2026 Embedded
+ * CTF (eCTF). This code is being provided only for educational purposes for
+ * the 2026 MITRE eCTF competition, and may not meet MITRE standards for
+ * quality. Use this code at your own risk!
+ *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
-#ifndef __SECURITY_H__
-#define __SECURITY_H__
 
-#include <stdbool.h>
+#ifndef SECURITY_H
+#define SECURITY_H
+
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
+
+/* CPU frequency assumed by delay helpers. */
+#define CPU_FREQ_HZ     32000000UL
+#define CYCLES_PER_MS   (CPU_FREQ_HZ / 1000UL)
 
 /* ------------------------------------------------------------------ */
-/* Constants                                                           */
-/* ------------------------------------------------------------------ */
-
-#define MAX_PERMS         8
-#define MAX_FILE_COUNT    8
-#define MAX_NAME_SIZE     32
-#define MAX_CONTENTS_SIZE 8192
-
-/* PIN is exactly 6 lowercase hex ASCII characters as received from host
- * (e.g. "1a2b3c").  check_pin_cmp() passes these 6 bytes directly to
- * hmac_sha256(); secrets_to_c_header.py must use pin.encode('ascii') so
- * the build-time PIN_HMAC matches what the runtime computes. */
-#define PIN_LENGTH    6
-
-/* MSPM0L2228 runs at 32 MHz. */
-#define CYCLES_PER_MS 32000
-
-/* ------------------------------------------------------------------ */
-/* Types                                                               */
+/* Permission Types                                                    */
 /* ------------------------------------------------------------------ */
 
 typedef enum {
-    PERM_READ    = 'R',
-    PERM_WRITE   = 'W',
-    PERM_RECEIVE = 'C',
+    PERM_READ  = 0,
+    PERM_WRITE = 1,
 } permission_enum_t;
+
+#define MAX_PERM_COUNT  8
 
 typedef struct {
     uint16_t group_id;
-    bool     read;
-    bool     write;
-    bool     receive;
-} group_permission_t;
+    uint8_t  perm;
+} permission_entry_t;
+
+/* Populated by commands.c at boot from the stored permission table. */
+extern permission_entry_t global_permissions[];
+extern int                global_perm_count;
 
 /* ------------------------------------------------------------------ */
-/* Glitch-hardening macros                                             */
+/* Slot / Name / Content Constants                                     */
 /* ------------------------------------------------------------------ */
 
-/*
- * SECURE_PIN_CHECK — double-evaluate check_pin_cmp() with no delay between
- * passes.  Halts device on disagreement (single-glitch bypass still requires
- * a double-glitch to defeat both passes simultaneously).
- *
- * random_delay() was removed: we do not defend against double-glitch attacks,
- * and timing/power analysis on the PIN path is handled by the XOR accumulator
- * in secure_compare() and wolfcrypt's bitsliced AES.
- *
- * ok1, ok2 must be declared volatile bool by the caller.
- * The caller is responsible for zeroing pin_ptr and applying the 5-second
- * penalty on failure after this macro expands.
- */
-#define SECURE_PIN_CHECK(ok1, ok2, pin_ptr)         \
-    do {                                             \
-        (ok1) = check_pin_cmp(pin_ptr);             \
-        (ok2) = check_pin_cmp(pin_ptr);             \
-        if ((bool)(ok1) != (bool)(ok2)) {           \
-            security_halt();                         \
-        }                                            \
-    } while (0)
+#define NUM_SLOTS           8
+#define MAX_NAME_SIZE       64
+#define MAX_CONTENTS_SIZE   2048
+#define MAX_PERM_LIST       8
+#define PIN_LENGTH          6
 
-/*
- * SECURE_BOOL_CHECK — double-evaluate any side-effect-free boolean
- * expression with no delay between passes.
+/* ------------------------------------------------------------------ */
+/* Glitch-Resistant Check Macros                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @brief Double-evaluate a boolean expression and halt on disagreement.
+ *
+ * Evaluates expr twice into ok1 and ok2.  If the two volatile results
+ * differ, a fault injection is assumed and security_halt() is called.
  * Halts device on disagreement (single fault injection still caught).
  *
  * random_delay() removed for same reasons as SECURE_PIN_CHECK.
@@ -100,23 +85,15 @@ void delay_cycles(uint32_t cycles);
 void delay_ms(uint32_t ms);
 
 /**
- * @brief Short random jitter: 0–~4 ms from one TRNG byte.
- *
- * Available for future use.  No longer called on any hot path —
- * double-glitch defence is out of scope and timing analysis is handled
- * by the XOR accumulator + wolfcrypt bitsliced AES.
- */
-void random_delay(void);
-
-/**
- * @brief Wide random jitter: 0–~20 ms from two TRNG bytes.
+ * @brief Random jitter: 0–~20 ms from two TRNG bytes.
  *
  * Called in crypto.c before every wc_AesGcmSetKey() to slide the
- * key-schedule power signature across a larger trace window.  Wider
- * range means CPA requires proportionally more traces to average out.
- * Only used on the AES path; does not affect interrogate timing.
+ * key-schedule power signature across a ~20 ms trace window.  CPA
+ * requires traces aligned to within a few samples; ±640 k sample
+ * positions of uncertainty forces proportionally more traces.
+ * Also available for any other hot path that needs SCA desync.
  */
-void random_delay_wide(void);
+void random_delay(void);
 
 /* ------------------------------------------------------------------ */
 /* Memory Functions                                                    */
@@ -149,34 +126,39 @@ uint8_t  trng_read_byte(void);
  * @brief Constant-time byte comparison.  XOR accumulator, no early exit.
  *        Used for all HMAC tag comparisons.
  */
-bool secure_compare(const void *a, const void *b, size_t len);
+bool secure_compare(const uint8_t *a, const uint8_t *b, size_t len);
 
 /**
- * @brief Single-pass HMAC-based PIN check.  No brute-force penalty.
- *        Never call directly — always use SECURE_PIN_CHECK or check_pin().
- */
-bool check_pin_cmp(const unsigned char *pin);
-
-/**
- * @brief Double-pass PIN check with 5-second failure penalty.
- *        Zeros pin buffer on all exit paths.
+ * @brief HMAC-based PIN verification with 5-second failure penalty.
+ *        Double-evaluates and halts on fault-injection mismatch.
+ *        Zeroes the pin buffer on every exit path.
  */
 bool check_pin(unsigned char *pin);
 
 /**
- * @brief Double-pass permission check for local group permissions.
- *        Halts on pass disagreement (single-fault resistance).
+ * @brief Single-pass HMAC PIN check.  Never call directly from a handler —
+ *        always use check_pin() which double-evaluates and penalises.
+ */
+bool check_pin_cmp(const unsigned char *pin);
+
+/* ------------------------------------------------------------------ */
+/* Validation Functions                                                */
+/* ------------------------------------------------------------------ */
+
+/** Returns true iff slot is in [0, NUM_SLOTS). */
+bool validate_slot(uint8_t slot);
+
+/** Returns true iff name contains only printable ASCII and is null-terminated
+ *  within max_len bytes. */
+bool validate_name(const char *name, size_t max_len);
+
+/** Returns true iff count is in [0, MAX_PERM_COUNT]. */
+bool validate_perm_count(int count);
+
+/**
+ * @brief Double-pass scan of global_permissions[] for (group_id, perm).
+ *        Halts if the two passes disagree (fault injection defence).
  */
 bool validate_permission(uint16_t group_id, permission_enum_t perm);
 
-/* ------------------------------------------------------------------ */
-/* Input Validation Functions                                          */
-/* ------------------------------------------------------------------ */
-
-bool validate_slot(uint8_t slot);
-bool validate_name(const char *name, size_t max_len);
-bool validate_perm_count(uint8_t count);
-bool validate_contents_len(uint16_t len);
-bool validate_bool(uint8_t value);
-
-#endif /* __SECURITY_H__ */
+#endif /* SECURITY_H */

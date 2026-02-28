@@ -56,18 +56,10 @@ void delay_ms(uint32_t ms)
 
 void random_delay(void)
 {
-    /* 0–~4 ms jitter from one TRNG byte.  Kept for future use but no longer
-     * called on any hot path — double-glitch is out of scope, and timing
-     * analysis is handled by the XOR accumulator + wolfcrypt bitsliced AES. */
-    uint32_t jitter = (uint32_t)(trng_read_byte() & 0x7F) * (CYCLES_PER_MS / 32);
-    delay_cycles(jitter);
-}
-
-void random_delay_wide(void)
-{
-    /* 0–~20 ms jitter for SCA pre-key-load desynchronisation.
-     * Two TRNG bytes → 16-bit value; range ~0–640k cycles ≈ 0–20 ms.
-     * Wider window means CPA requires proportionally more traces. */
+    /* 0–~20 ms SCA desync jitter.
+     * Two TRNG bytes → 16-bit value; range ~0–640 k cycles ≈ 0–20 ms.
+     * Wider window means CPA requires proportionally more traces to
+     * average out the key-schedule power signature. */
     uint32_t lo     = (uint32_t)trng_read_byte();
     uint32_t hi     = (uint32_t)trng_read_byte();
     uint32_t jitter = ((hi << 8) | lo) * (CYCLES_PER_MS / 3277);
@@ -82,87 +74,76 @@ void secure_zero(void *ptr, size_t len)
 {
     volatile uint8_t *p = (volatile uint8_t *)ptr;
     size_t i;
-    /* Loop counter i in [0, len); terminates exactly when i == len. */
+    /* Loop counter i in [0, len); constant-time for all inputs. */
     for (i = 0; i < len; i++) {
         p[i] = 0;
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Security Halt                                                       */
+/* ------------------------------------------------------------------ */
+
 void security_halt(void)
 {
     __disable_irq();
-    while (1) { __asm volatile("nop"); }
+    /* Spin forever — no return. */
+    while (1) {
+        __asm volatile("NOP");
+    }
 }
 
 /* ------------------------------------------------------------------ */
-/* Hardware TRNG Functions                                             */
+/* Hardware TRNG                                                       */
 /* ------------------------------------------------------------------ */
 
 int trng_init(void)
 {
-    uint32_t poll_i;
+    uint32_t poll = 0;
 
-    DL_TRNG_enablePower(TRNG);
-#ifdef POWER_STARTUP_DELAY
-    delay_cycles(POWER_STARTUP_DELAY);
-#else
-    delay_cycles(32000);
-#endif
+    DL_TRNG_reset(TRNG);
+    DL_TRNG_enable(TRNG);
 
-    DL_TRNG_setClockDivider(TRNG, DL_TRNG_CLOCK_DIVIDE_2);
-    DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
-
-    /* Poll until the clock divider register confirms normal-function mode.
-     * Loop counter poll_i in [0, TRNG_POLL_LIMIT). */
-    for (poll_i = 0;
-         DL_TRNG_getClockDivider(TRNG) != DL_TRNG_CLOCK_DIVIDE_2 &&
-         poll_i < TRNG_POLL_LIMIT;
-         poll_i++) {}
-
-    if (poll_i >= TRNG_POLL_LIMIT) {
-        security_halt();
+    /* Wait for TRNG to be ready; halt if self-test never completes. */
+    while (DL_TRNG_getClockDivider(TRNG) == 0) {
+        if (++poll >= TRNG_POLL_LIMIT) {
+            security_halt();
+        }
     }
-
     return 0;
 }
 
 uint32_t trng_read_word(void)
 {
-    uint32_t poll_i;
+    uint32_t poll = 0;
 
-    DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
+    DL_TRNG_generateData(TRNG);
 
-    /* Poll until capture-ready flag is set.
-     * Loop counter poll_i in [0, TRNG_POLL_LIMIT). */
-    for (poll_i = 0;
-         !DL_TRNG_isCaptureReady(TRNG) && poll_i < TRNG_POLL_LIMIT;
-         poll_i++) {}
-
-    if (poll_i >= TRNG_POLL_LIMIT) {
-        security_halt();
+    while (DL_TRNG_getStatus(TRNG) != DL_TRNG_STATUS_DATA_READY) {
+        if (++poll >= TRNG_POLL_LIMIT) {
+            security_halt();
+        }
     }
-
-    return DL_TRNG_getCapture(TRNG);
+    return DL_TRNG_getData(TRNG);
 }
 
 uint8_t trng_read_byte(void)
 {
-    return (uint8_t)(trng_read_word() & 0xFF);
+    /* Low byte of a fresh 32-bit word. */
+    return (uint8_t)(trng_read_word() & 0xFFU);
 }
 
 /* ------------------------------------------------------------------ */
 /* Authentication Functions                                            */
 /* ------------------------------------------------------------------ */
 
-bool secure_compare(const void *a, const void *b, size_t len)
+bool secure_compare(const uint8_t *a, const uint8_t *b, size_t len)
 {
     const uint8_t *pa  = (const uint8_t *)a;
     const uint8_t *pb  = (const uint8_t *)b;
-    uint8_t        acc = 0;
-    size_t         i;
-
-    /* XOR accumulator: acc == 0 iff all bytes equal.
-     * Loop counter i in [0, len); constant-time for all inputs. */
+    volatile uint8_t acc = 0;
+    size_t i;
+    /* Loop counter i in [0, len); constant-time for all inputs. */
     for (i = 0; i < len; i++) {
         acc |= pa[i] ^ pb[i];
     }
@@ -249,86 +230,55 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
     int           i, j;
 
     /* First pass. */
-    for (i = 0; i < PERM_COUNT; i++) {
-        bool group_match = (global_permissions[i].group_id == group_id);
-        bool has_perm    = false;
-
-        switch (perm) {
-        case PERM_READ:    has_perm = global_permissions[i].read;    break;
-        case PERM_WRITE:   has_perm = global_permissions[i].write;   break;
-        case PERM_RECEIVE: has_perm = global_permissions[i].receive; break;
-        default: break;
+    for (i = 0; i < global_perm_count; i++) {
+        if (global_permissions[i].group_id == group_id &&
+            global_permissions[i].perm     == (uint8_t)perm) {
+            found_pass1 = true;
         }
-
-        if (group_match && has_perm) { found_pass1 = true; }
     }
 
-    /* Second pass — no random_delay between passes. */
-    for (j = 0; j < PERM_COUNT; j++) {
-        bool group_match = (global_permissions[j].group_id == group_id);
-        bool has_perm    = false;
-
-        switch (perm) {
-        case PERM_READ:    has_perm = global_permissions[j].read;    break;
-        case PERM_WRITE:   has_perm = global_permissions[j].write;   break;
-        case PERM_RECEIVE: has_perm = global_permissions[j].receive; break;
-        default: break;
+    /* Second pass. */
+    for (j = 0; j < global_perm_count; j++) {
+        if (global_permissions[j].group_id == group_id &&
+            global_permissions[j].perm     == (uint8_t)perm) {
+            found_pass2 = true;
         }
-
-        if (group_match && has_perm) { found_pass2 = true; }
     }
 
-    /* Passes must agree; disagreement indicates a fault injection attempt. */
     if ((bool)found_pass1 != (bool)found_pass2) {
         security_halt();
     }
 
-    return found_pass1;
+    return (bool)found_pass1;
 }
 
 /* ------------------------------------------------------------------ */
-/* Input Validation Functions                                          */
+/* Validation Functions                                                */
 /* ------------------------------------------------------------------ */
 
 bool validate_slot(uint8_t slot)
 {
-    return (slot < MAX_FILE_COUNT);
+    return (slot < NUM_SLOTS);
 }
 
 bool validate_name(const char *name, size_t max_len)
 {
     size_t i;
 
-    if (name == NULL) { return false; }
+    if (name == NULL || max_len == 0) { return false; }
 
-    /* Loop counter i in [0, max_len); terminates on null or bound. */
+    /* Loop counter i in [0, max_len); terminates at null or max_len. */
     for (i = 0; i < max_len; i++) {
-        char c = name[i];
-
-        if (c == '\0') {
-            return (i > 0);  /* Must have at least one character before null. */
-        }
-
-        /* Only printable ASCII 0x20–0x7E. */
-        if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7E) {
+        if (name[i] == '\0') { return true; }
+        if ((unsigned char)name[i] < 0x20 || (unsigned char)name[i] > 0x7E) {
             return false;
         }
     }
-
-    return false;  /* No null terminator found within max_len bytes. */
+    /* No null terminator found within max_len — reject. */
+    return false;
 }
 
-bool validate_perm_count(uint8_t count)
+bool validate_perm_count(int count)
 {
-    return (count <= MAX_PERMS);
-}
-
-bool validate_contents_len(uint16_t len)
-{
-    return (len <= MAX_CONTENTS_SIZE);
-}
-
-bool validate_bool(uint8_t value)
-{
-    return (value == 0 || value == 1);
+    return (count >= 0 && count <= MAX_PERM_COUNT);
 }

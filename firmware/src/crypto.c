@@ -22,7 +22,7 @@
  *     Eliminates data-dependent memory access patterns (root cause of
  *     cache-DPA / SPA on table-based AES).  Requires HAVE_AES_ECB.
  *
- *   Layer 2  random_delay_wide() (before wc_AesGcmSetKey)
+ *   Layer 2  random_delay() (before wc_AesGcmSetKey)
  *     Two TRNG bytes produce a 0–~20 ms jitter window.  CPA requires
  *     traces aligned to within a few samples; ±640 k sample positions of
  *     uncertainty forces an attacker to collect proportionally more traces
@@ -76,7 +76,7 @@ int generate_nonce(uint8_t *nonce_out)
 /* -----------------------------------------------------------------------
  * aes_gcm_encrypt — AES-256-GCM encryption via wolfcrypt.
  *
- * SCA Layer 2: random_delay_wide() before wc_AesGcmSetKey slides the
+ * SCA Layer 2: random_delay() before wc_AesGcmSetKey slides the
  * key-schedule power signature across a ~20 ms trace window.
  * SCA Layer 1: WC_AES_BITSLICED build flag eliminates table-lookup leakage.
  * ---------------------------------------------------------------------- */
@@ -97,7 +97,7 @@ int aes_gcm_encrypt(const uint8_t *key,
         return -1;
     }
 
-    random_delay_wide();   /* SCA Layer 2 */
+    random_delay();   /* SCA Layer 2 */
 
     ret = wc_AesGcmSetKey(&ctx, key, GCM_KEY_SIZE);
     if (ret != 0) {
@@ -143,7 +143,7 @@ int aes_gcm_decrypt(const uint8_t *key,
         return -1;
     }
 
-    random_delay_wide();   /* SCA Layer 2 */
+    random_delay();   /* SCA Layer 2 */
 
     ret = wc_AesGcmSetKey(&ctx, key, GCM_KEY_SIZE);
     if (ret != 0) {
