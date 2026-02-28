@@ -23,7 +23,7 @@
  *     read  → secure_read_file           8300 B  (s_work.rsp used, not stack)
  *     receive                            8600 B  receive_r4_t r4
  *     listen / RECEIVE_MSG               8700 B  union u (file_t / r4 shared)
- *     listen / INTERROGATE_MSG           9300 B  file_t tmp + resp_list + hmac_input
+ *     listen / INTERROGATE_MSG           1000 B  file_header_t hdr + resp_list + hmac_input
  *
  *   s_work union: members share 8224 bytes of static .bss.
  *   All commands are sequential on bare metal; members never overlap in use.
@@ -42,6 +42,7 @@
 #include <stdbool.h>
 
 #include "host_messaging.h"
+#include "simple_uart.h"
 #include "commands.h"
 #include "filesystem.h"
 #include "security.h"
@@ -200,7 +201,8 @@ static void generate_list_files(list_response_t *file_list)
  ******************** COMMAND HANDLERS ********************
  **********************************************************/
 
-/* LIST — PIN checked BEFORE generating list to prevent filename leakage. */
+/* LIST — PIN checked BEFORE generating list to prevent filename leakage.
+ */
 int list(uint16_t pkt_len, uint8_t *buf)
 {
     list_command_t  *command = (list_command_t *)buf;
@@ -687,7 +689,8 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
  *   Total ≈ 8.9 KB.  Plaintext lives in s_work.plain (static).
  *
  * INTERROGATE_MSG stack peak:
- *   file_t tmp(8277) + ir2(316) + resp_list(284) + hmac_input(296) ≈ 9.3 KB.
+ *   file_header_t hdr(55) + ir2(316) + resp_list(284) + hmac_input(296) ≈ 1 KB.
+ *   file_t tmp replaced by file_header_t hdr — eliminates 8277-byte stack overflow.
  *
  * NOTE: RECEIVE_MSG branch does NOT call is_slot_in_use() separately.
  *   That function allocates file_t probe (8277 B) while union u is already
@@ -955,7 +958,7 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         interrogate_r2_t  ir2;
         list_response_t   resp_list;
         uint8_t           hmac_input[NONCE_SIZE + sizeof(list_response_t)];
-        file_t            tmp;      /* 8277 B — for reading slot group_ids */
+        file_header_t     hdr;      /* 55 B — replaces 8277 B file_t tmp */
         uint16_t          list_len;
         uint8_t           slot_i;  /* loop counter */
 
@@ -979,28 +982,26 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         print_debug("LSN-INT: R1 validated, building filtered file list");
 
         /* Build filtered list — only include slots the initiator can receive.
+         * Uses read_file_header() (55 B) instead of read_file() (8277 B) to
+         * keep the stack peak for this branch under 1 KB.
          * Loop counter slot_i in [0, MAX_FILE_COUNT); terminates when equal. */
         memset(&resp_list, 0, sizeof(resp_list));
         for (slot_i = 0; slot_i < MAX_FILE_COUNT; slot_i++) {
-            if (read_file(slot_i, &tmp) != 0) { continue; }
-            if (tmp.in_use != FILE_IN_USE) {
-                secure_zero(&tmp, sizeof(tmp));
-                continue;
-            }
+            if (read_file_header(slot_i, &hdr) != 0) { continue; }
             if (!perm_bytes_has_receive(ir1->perms, ir1->perm_count,
-                                        tmp.group_id)) {
-                secure_zero(&tmp, sizeof(tmp));
+                                        hdr.group_id)) {
+                secure_zero(&hdr, sizeof(hdr));
                 continue;
             }
 
             uint32_t idx = resp_list.n_files;
             resp_list.metadata[idx].slot     = slot_i;
-            resp_list.metadata[idx].group_id = tmp.group_id;
-            strncpy(resp_list.metadata[idx].name, tmp.name, MAX_NAME_SIZE - 1);
+            resp_list.metadata[idx].group_id = hdr.group_id;
+            strncpy(resp_list.metadata[idx].name, hdr.name, MAX_NAME_SIZE - 1);
             resp_list.metadata[idx].name[MAX_NAME_SIZE - 1] = '\0';
             resp_list.n_files = idx + 1;
 
-            secure_zero(&tmp, sizeof(tmp));
+            secure_zero(&hdr, sizeof(hdr));
         }
         print_debug("LSN-INT: list built, computing resp_auth");
 
