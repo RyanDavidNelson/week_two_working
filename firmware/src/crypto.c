@@ -59,14 +59,16 @@
 
 
 /* -----------------------------------------------------------------------
- * aesadv_reset_and_enable — power-enable then hardware-reset AESADV.
+ * aesadv_reset_and_enable — power-enable, hardware-reset, then wait for
+ * the context-writeable flag before returning.
  *
- * DL_AESADV_reset() only ASSERTS the reset; the peripheral continues
- * resetting for several bus cycles.  We must poll STAT.RESETSTKY until
- * it goes high (reset cycle complete) before touching any functional
- * registers — otherwise key/CTRL writes land during reset and are lost.
+ * DL_AESADV_reset() self-clears within ~2 PCLK cycles, but CNTXT_RDY in
+ * the CTRL register is not guaranteed asserted by the time the CPU reaches
+ * the next instruction. Writing the key or CTRL before CNTXT_RDY=1 causes
+ * the peripheral to silently reject the write and never assert INPUT_RDY,
+ * which exhausts poll_input_ready() and triggers security_halt().
  *
- * Loop counter poll_i in [0, AESADV_POLL_LIMIT); halts on timeout.
+ * Pattern taken directly from aesadv_ecb_256_encrypt TI SDK example.
  * ---------------------------------------------------------------------- */
 static void aesadv_reset_and_enable(void)
 {
@@ -76,20 +78,19 @@ static void aesadv_reset_and_enable(void)
     AESADV->GPRCM.PWREN =
         (AESADV_PWREN_KEY_UNLOCK_W | AESADV_PWREN_ENABLE_ENABLE);
 
-    /* Assert reset; this also clears the previous RESETSTKY sticky bit. */
+    /* Hardware reset — clears CTRL, key registers, IV, TAG, DMA_HS. */
     DL_AESADV_reset(AESADV);
 
-    /* Wait for STAT.RESETSTKY to go high — set when the reset cycle finishes.
-     * Loop counter poll_i in [0, AESADV_POLL_LIMIT). */
+    /* Wait for context to become writeable before any key/config writes.
+     * Loop counter poll_i in [0, AESADV_POLL_LIMIT); halts on timeout. */
     for (poll_i = 0U;
-         !DL_AESADV_isReset(AESADV) && poll_i < AESADV_POLL_LIMIT;
+         !DL_AESADV_isInputContextWriteable(AESADV) && poll_i < AESADV_POLL_LIMIT;
          poll_i++) {}
 
     if (poll_i >= AESADV_POLL_LIMIT) {
         security_halt();
     }
 }
-
 
 /* -----------------------------------------------------------------------
  * poll_input_ready — wait until AESADV input buffer is empty.
