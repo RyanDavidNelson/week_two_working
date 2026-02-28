@@ -61,19 +61,33 @@
 /* -----------------------------------------------------------------------
  * aesadv_reset_and_enable — power-enable then hardware-reset AESADV.
  *
- * The reset clears key registers. Calling this before each operation
- * guarantees a clean slate regardless of prior state.
+ * DL_AESADV_reset() only ASSERTS the reset; the peripheral continues
+ * resetting for several bus cycles.  We must poll STAT.RESETSTKY until
+ * it goes high (reset cycle complete) before touching any functional
+ * registers — otherwise key/CTRL writes land during reset and are lost.
+ *
+ * Loop counter poll_i in [0, AESADV_POLL_LIMIT); halts on timeout.
  * ---------------------------------------------------------------------- */
 static void aesadv_reset_and_enable(void)
 {
-    /* Power enable (idempotent if already on). No settle delay required —
-     * AESADV is a fully digital peripheral; register writes take immediate
-     * effect unlike the TRNG analog blocks that need 32 k cycles. */
+    uint32_t poll_i;
+
+    /* Power enable — idempotent if already on. */
     AESADV->GPRCM.PWREN =
         (AESADV_PWREN_KEY_UNLOCK_W | AESADV_PWREN_ENABLE_ENABLE);
 
-    /* Hardware reset — clears CTRL, key registers, IV, TAG, DMA_HS. */
+    /* Assert reset; this also clears the previous RESETSTKY sticky bit. */
     DL_AESADV_reset(AESADV);
+
+    /* Wait for STAT.RESETSTKY to go high — set when the reset cycle finishes.
+     * Loop counter poll_i in [0, AESADV_POLL_LIMIT). */
+    for (poll_i = 0U;
+         !DL_AESADV_isReset(AESADV) && poll_i < AESADV_POLL_LIMIT;
+         poll_i++) {}
+
+    if (poll_i >= AESADV_POLL_LIMIT) {
+        security_halt();
+    }
 }
 
 
@@ -256,7 +270,7 @@ static int aesadv_gcm_run(DL_AESADV_DIR    direction,
                                               ARM loads iv[12..15] as uint32
                                               IV3 = 0x01000000 (LE), per TRM */
 
-    /* --- Power-enable and reset (clears previous key/state) --- */
+    /* --- Power-enable and reset; poll until reset cycle completes --- */
     aesadv_reset_and_enable();
 
     /* --- Disable DMA; use CPU register polling --- */
@@ -280,6 +294,13 @@ static int aesadv_gcm_run(DL_AESADV_DIR    direction,
 
     /* --- Feed AAD (auth-only, no ciphertext produced) --- */
     feed_aad_blocks(aad, aad_len);
+
+    /* GCM autonomous mode needs a crypto-phase trigger even when data_len
+     * is zero (GMAC / AAD-only case); forceInputDataAvailable() provides
+     * that kick so poll_tag_ready() does not hang. */
+    if (data_len == 0U) {
+        DL_AESADV_forceInputDataAvailable(AESADV);
+    }
 
     /* --- Feed crypto data and collect output --- */
     feed_crypto_blocks(in_buf, out_buf, data_len);
