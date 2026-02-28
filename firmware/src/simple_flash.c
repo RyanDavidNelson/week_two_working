@@ -35,7 +35,7 @@ int flash_simple_erase_page(uint32_t address) {
     if (cmdStatus == DL_FLASHCTL_COMMAND_STATUS_FAILED) {
         return -1;
     }
-    // returns a boolean, so handle that accordingly
+    /* returns a boolean, so handle that accordingly */
     bool ret = DL_FlashCTL_waitForCmdDone(FLASHCTL);
     if (ret == false) {
         return -1;
@@ -54,7 +54,7 @@ int flash_simple_erase_page(uint32_t address) {
  * with the specified amount of bytes
 */
 void flash_simple_read(uint32_t address, void* buffer, uint32_t size) {
-    // flash is memory mapped, and the flash controller has no read functionality
+    /* flash is memory mapped, and the flash controller has no read functionality */
     memcpy(buffer, (void *)address, size);
 }
 
@@ -71,33 +71,72 @@ void flash_simple_read(uint32_t address, void* buffer, uint32_t size) {
  * with the specified amount of bytes. Flash memory can only be written in one
  * way e.g. 1->0. To rewrite previously written memory see the
  * flash_simple_erase_page documentation.
+ *
+ * STACK FIX: the original used a VLA sized to the entire write (up to ~8280 B
+ * for a max file), which overflowed the stack when secure_write_file() already
+ * held a file_t (~8277 B) in the same call chain.  The fix stages one
+ * FLASH_PAGE_SIZE chunk at a time into a static buffer (1032 B), keeping peak
+ * stack growth for this function near zero.  Callers (write_file, store_fat)
+ * already erase all target pages before calling here, so writing page-by-page
+ * is safe.  unprotectSector is called per chunk because protection state is
+ * per-sector; the original only unprotected the first sector, which was a
+ * latent bug for multi-page writes.
 */
 int flash_simple_write(uint32_t address, void* buffer, uint32_t size) {
     volatile DL_FLASHCTL_COMMAND_STATUS cmdStatus;
+    bool     ret;
+    uint32_t offset;       /* byte offset into buffer — loop counter            */
+    uint32_t chunk_bytes;  /* bytes in this iteration (≤ FLASH_PAGE_SIZE)       */
+    uint32_t chunk_words;  /* 32-bit words to program, rounded up to even count */
+
+    /*
+     * Static staging buffer: replaces the former VLA.
+     *
+     * Worst-case chunk_words derivation (chunk_bytes ≤ FLASH_PAGE_SIZE = 1024):
+     *   chunk_bytes = 1024 → chunk_words = 256 (already even, no rounding)
+     *   chunk_bytes = 1023 → 1023/4 = 255 (odd)  → round word up → 256
+     *   chunk_bytes = 1022 → 1022/4 = 255 (odd)  → round word up → 256
+     *   chunk_bytes = 1021 → 1021/4 = 255 (odd)  → round word up → 256
+     * Maximum chunk_words is 256 for any chunk.
+     * Buffer sized at (FLASH_PAGE_SIZE/4) + 2 = 258 words for safe margin.
+     */
+    static uint32_t write_page[(FLASH_PAGE_SIZE / 4) + 2]; /* 258 × 4 = 1032 B */
+
     DL_FlashCTL_executeClearStatus(FLASHCTL);
-    DL_FlashCTL_unprotectSector(FLASHCTL, address, DL_FLASHCTL_REGION_SELECT_MAIN);
 
-    // program function expects size to be the number of 32-bit words
-    uint32_t size_32b = (size % 4 == 0) ? (size / 4) : (size / 4) + 1;
-    // it also expects it to be an even number
-    size_32b = (size_32b % 2 == 0) ? size_32b : size_32b + 1;
+    /* Write one flash page at a time.
+     * Loop counter offset in [0, size); terminates when offset >= size. */
+    for (offset = 0; offset < size; offset += FLASH_PAGE_SIZE) {
 
-    // write the data into a correctly sized region to ensure no undefined behavior
-    uint32_t write_data[size_32b];
-    memset(write_data, 0xff, size_32b*4);
-    memcpy(write_data, buffer, size);
+        /* Bytes remaining vs. one full page. */
+        chunk_bytes = (size - offset < (uint32_t)FLASH_PAGE_SIZE)
+                      ? (size - offset) : (uint32_t)FLASH_PAGE_SIZE;
 
-    // if memory section is corrected, make sure to write the ECC (you have been warned)
-    cmdStatus = DL_FlashCTL_programMemoryBlockingFromRAM64WithECCGenerated(
-        FLASHCTL, address, (uint32_t *)write_data, size_32b, DL_FLASHCTL_REGION_SELECT_MAIN
-    );
-    if (cmdStatus == DL_FLASHCTL_COMMAND_STATUS_FAILED) {
-        return -1;
-    }
-    // returns a boolean, so handle that accordingly
-    bool ret = DL_FlashCTL_waitForCmdDone(FLASHCTL);
-    if (ret == false) {
-        return -1;
+        /* Round up to a 32-bit word count, then ensure even (ECC requirement). */
+        chunk_words = (chunk_bytes % 4u == 0u)
+                      ? (chunk_bytes / 4u) : (chunk_bytes / 4u) + 1u;
+        chunk_words = (chunk_words % 2u == 0u) ? chunk_words : chunk_words + 1u;
+
+        /* Stage chunk into the static aligned buffer; pad tail with 0xFF. */
+        memset(write_page, 0xFF, chunk_words * 4u);
+        memcpy(write_page, (const uint8_t *)buffer + offset, chunk_bytes);
+
+        /* Each sector requires its own unprotect call before programming. */
+        DL_FlashCTL_unprotectSector(FLASHCTL, address + offset,
+                                    DL_FLASHCTL_REGION_SELECT_MAIN);
+
+        /* Program function expects size in 32-bit words. */
+        cmdStatus = DL_FlashCTL_programMemoryBlockingFromRAM64WithECCGenerated(
+            FLASHCTL, address + offset, write_page, chunk_words,
+            DL_FLASHCTL_REGION_SELECT_MAIN);
+        if (cmdStatus == DL_FLASHCTL_COMMAND_STATUS_FAILED) {
+            return -1;
+        }
+        /* Returns a boolean, so handle that accordingly. */
+        ret = DL_FlashCTL_waitForCmdDone(FLASHCTL);
+        if (ret == false) {
+            return -1;
+        }
     }
     return 0;
 }
