@@ -125,7 +125,7 @@ $(BUILDDIR)/%.so: ./src/%.c | $(BUILDDIR)
 # wolfSSL source files → BUILDDIR
 $(BUILDDIR)/%.so: $(WOLFSSL_SRC)/%.c | $(BUILDDIR)
 	@ echo Building WolfSSL: $@
-	@ $(CC) $(CFLAGS) -c $< -o $@
+	@ $(CC) $(CFLAGS) -O2 -c $< -o $@
 
 $(BUILDDIR)/$(NAME).elf: $(OBJECTS)
 	@ echo Linking $@
