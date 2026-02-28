@@ -1,4 +1,3 @@
-
 /**
  * @file filesystem.h
  * @brief eCTF flash-based filesystem management
@@ -112,6 +111,21 @@ typedef struct {
 } file_t;
 #pragma pack(pop)
 
+/*
+ * Lightweight header covering only the fields needed by LSN-INT's filter loop.
+ * in_use(4) + slot(1) + uuid(16) + group_id(2) + name(32) = 55 bytes.
+ * Avoids placing a full 8277-byte file_t on the stack in listen().
+ */
+#define FILE_HEADER_SIZE 55
+
+typedef struct {
+    uint32_t in_use;            /* FILE_IN_USE sentinel      */
+    uint8_t  slot;              /* Slot index                */
+    uint8_t  uuid[UUID_SIZE];   /* Copy of file UUID         */
+    uint16_t group_id;          /* Permission group ID       */
+    char     name[MAX_NAME_SIZE]; /* Null-terminated filename */
+} file_header_t;                /* 55 bytes                  */
+
 
 /**********************************************************
  *************** FAT MANAGEMENT ***************************
@@ -153,6 +167,19 @@ int read_file(slot_t slot, file_t *dest);
  * @return 0 if slot is in use, -1 if not in use or invalid slot.
  */
 int read_file_group_id(slot_t slot, uint16_t *out_group_id);
+
+/**
+ * @brief Read the 55-byte packed header (in_use through name) without
+ *  allocating a full file_t.
+ *
+ * Avoids placing an 8277-byte file_t on the stack in the LSN-INT filter loop.
+ * Layout read: in_use(4) + slot(1) + uuid(16) + group_id(2) + name(32) = 55 B.
+ *
+ * @param slot  Source slot.
+ * @param out   Output file_header_t; zeroed by caller on error paths.
+ * @return 0 if slot is in use, -1 if not in use or invalid slot/dest.
+ */
+int read_file_header(slot_t slot, file_header_t *out);
 
 /** @brief Write raw file_t to flash and update the FAT entry.
  *  @return 0 on success, -1 on invalid inputs. */
