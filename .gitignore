@@ -344,3 +344,5 @@ firmware/src/secrets.c
 global.secrets
 ectf26_design/src/__pycache__/
 *.pyc
+__pycache__/
+*.pyc
