@@ -59,38 +59,34 @@
 
 
 /* -----------------------------------------------------------------------
- * aesadv_reset_and_enable — power-enable, hardware-reset, then wait for
- * the context-writeable flag before returning.
+ * aesadv_reset_and_enable — hardware-reset then power-enable AESADV.
  *
- * DL_AESADV_reset() self-clears within ~2 PCLK cycles, but CNTXT_RDY in
- * the CTRL register is not guaranteed asserted by the time the CPU reaches
- * the next instruction. Writing the key or CTRL before CNTXT_RDY=1 causes
- * the peripheral to silently reject the write and never assert INPUT_RDY,
- * which exhausts poll_input_ready() and triggers security_halt().
+ * TI SDK init pattern (see SYSCFG_DL_initPower): reset → enablePower →
+ * settle delay.  GPRCM registers (RSTCTL, PWREN) are always accessible
+ * regardless of power state, so RSTCTL can be written before PWREN.
  *
- * Pattern taken directly from aesadv_ecb_256_encrypt TI SDK example.
+ * The reset clears key registers, CTRL, IV, TAG, and DMA_HS. Calling
+ * this before each operation guarantees a clean slate regardless of
+ * prior state.  The settle delay is required: without it, the peripheral
+ * registers are not yet accessible when the key and CTRL writes follow,
+ * causing INPUT_RDY to never assert and a security_halt() timeout.
  * ---------------------------------------------------------------------- */
 static void aesadv_reset_and_enable(void)
 {
-    uint32_t poll_i;
-
-    /* Power enable — idempotent if already on. */
-    AESADV->GPRCM.PWREN =
-        (AESADV_PWREN_KEY_UNLOCK_W | AESADV_PWREN_ENABLE_ENABLE);
-
-    /* Hardware reset — clears CTRL, key registers, IV, TAG, DMA_HS. */
+    /* Reset before power-enable — clears CTRL, key registers, IV, TAG, DMA_HS.
+     * GPRCM registers are always accessible regardless of PWREN state. */
     DL_AESADV_reset(AESADV);
 
-    /* Wait for context to become writeable before any key/config writes.
-     * Loop counter poll_i in [0, AESADV_POLL_LIMIT); halts on timeout. */
-    for (poll_i = 0U;
-         !DL_AESADV_isInputContextWriteable(AESADV) && poll_i < AESADV_POLL_LIMIT;
-         poll_i++) {}
+    /* Power enable (idempotent if already on). */
+    DL_AESADV_enablePower(AESADV);
 
-    if (poll_i >= AESADV_POLL_LIMIT) {
-        security_halt();
-    }
+    /* 1 ms settle — peripheral registers not accessible until power is stable.
+     * Without this, INPUT_RDY never asserts and security_halt() fires.
+     * Uses delay_ms() (security.h) to avoid a direct delay_cycles() reference
+     * across translation units which upset the linker ordering. */
+    delay_ms(1);
 }
+
 
 /* -----------------------------------------------------------------------
  * poll_input_ready — wait until AESADV input buffer is empty.
@@ -271,7 +267,7 @@ static int aesadv_gcm_run(DL_AESADV_DIR    direction,
                                               ARM loads iv[12..15] as uint32
                                               IV3 = 0x01000000 (LE), per TRM */
 
-    /* --- Power-enable and reset; poll until reset cycle completes --- */
+    /* --- Reset → enablePower → settle (clears previous key/state) --- */
     aesadv_reset_and_enable();
 
     /* --- Disable DMA; use CPU register polling --- */
@@ -295,13 +291,6 @@ static int aesadv_gcm_run(DL_AESADV_DIR    direction,
 
     /* --- Feed AAD (auth-only, no ciphertext produced) --- */
     feed_aad_blocks(aad, aad_len);
-
-    /* GCM autonomous mode needs a crypto-phase trigger even when data_len
-     * is zero (GMAC / AAD-only case); forceInputDataAvailable() provides
-     * that kick so poll_tag_ready() does not hang. */
-    if (data_len == 0U) {
-        DL_AESADV_forceInputDataAvailable(AESADV);
-    }
 
     /* --- Feed crypto data and collect output --- */
     feed_crypto_blocks(in_buf, out_buf, data_len);
@@ -560,11 +549,11 @@ size_t build_transfer_aad(const uint8_t *recv_chal,
     uint8_t i;
     uint8_t pos = 0U;
 
-    /* recv_chal — loop counter i in [0, 12) */
-    for (i = 0U; i < 12U; i++) { out[pos++] = recv_chal[i]; }
+    /* recv_chal — loop counter i in [0, NONCE_SIZE) */
+    for (i = 0U; i < NONCE_SIZE; i++) { out[pos++] = recv_chal[i]; }
 
-    /* send_chal — loop counter i in [0, 12) */
-    for (i = 0U; i < 12U; i++) { out[pos++] = send_chal[i]; }
+    /* send_chal — loop counter i in [0, NONCE_SIZE) */
+    for (i = 0U; i < NONCE_SIZE; i++) { out[pos++] = send_chal[i]; }
 
     out[pos++] = slot;
 
