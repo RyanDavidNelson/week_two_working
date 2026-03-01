@@ -749,6 +749,14 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
  *   That function allocates file_t probe (8277 B) while union u is already
  *   live on the stack — pushing total to ~17 KB and overflowing.
  *   Instead, read_file() is called once and in_use is checked inline.
+ *
+ * DESYNC FIX: every error path that fires AFTER R2 was sent (i.e. the
+ * receiver is already blocking on R4) sends a best-effort ERROR_MSG on
+ * TRANSFER_INTERFACE before returning.  This lets receive() fail fast on
+ * cmd != RECEIVE_MSG instead of timing out, allowing it to report the error
+ * on CONTROL_INTERFACE before the test framework's next WRITE deadline.
+ * Without this, a permission rejection left the receiver stuck for the full
+ * UART timeout, causing a WRITE serial timeout and UART desync.
  */
 int listen(uint16_t pkt_len, uint8_t *buf)
 {
@@ -904,6 +912,13 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         secure_zero(&r2, sizeof(r2));
         print_debug("LSN-RCV: R2 sent, waiting R3");
 
+        /*
+         * R2 has been delivered — receiver is now committed to waiting for R4.
+         * Every error path from this point MUST send ERROR_MSG on
+         * TRANSFER_INTERFACE before returning so receive() can fail fast
+         * instead of timing out, preventing UART desync on the control side.
+         */
+
         /* ---- R3: receive and verify receiver auth + permissions ---- */
         memset(&r3, 0, sizeof(r3));
         r3_len = sizeof(r3);
@@ -915,6 +930,8 @@ int listen(uint16_t pkt_len, uint8_t *buf)
             secure_zero(send_chal, NONCE_SIZE);
             secure_zero(&r3, sizeof(r3));
             secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
+            /* Abort: unblock receiver waiting for R4. */
+            (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
             return -1;
         }
         print_debug("LSN-RCV: R3 received, validating perms + HMAC");
@@ -926,6 +943,8 @@ int listen(uint16_t pkt_len, uint8_t *buf)
             secure_zero(send_chal, NONCE_SIZE);
             secure_zero(&r3, sizeof(r3));
             secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
+            /* Abort: unblock receiver waiting for R4. */
+            (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
             return -1;
         }
         if (!hmac_verify(TRANSFER_AUTH_KEY, send_chal, NONCE_SIZE,
@@ -935,6 +954,8 @@ int listen(uint16_t pkt_len, uint8_t *buf)
             secure_zero(send_chal, NONCE_SIZE);
             secure_zero(&r3, sizeof(r3));
             secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
+            /* Abort: unblock receiver waiting for R4. */
+            (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
             return -1;
         }
         print_debug("LSN-RCV: R3 ok, checking receiver has RECEIVE perm");
@@ -947,6 +968,8 @@ int listen(uint16_t pkt_len, uint8_t *buf)
             secure_zero(send_chal, NONCE_SIZE);
             secure_zero(&r3, sizeof(r3));
             secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
+            /* Abort: unblock receiver waiting for R4. */
+            (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
             return -1;
         }
         secure_zero(&r3, sizeof(r3));
@@ -958,6 +981,8 @@ int listen(uint16_t pkt_len, uint8_t *buf)
             secure_zero(recv_chal, NONCE_SIZE);
             secure_zero(send_chal, NONCE_SIZE);
             secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
+            /* Abort: unblock receiver waiting for R4. */
+            (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
             return -1;
         }
 
@@ -986,6 +1011,8 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         if (ret != 0) {
             print_debug("LSN-RCV: transfer GCM encrypt fail");
             secure_zero(&u.fdata, sizeof(u.fdata));
+            /* Abort: unblock receiver waiting for R4. */
+            (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
             return -1;
         }
 
@@ -1010,7 +1037,7 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         interrogate_r1_t  *ir1 = (interrogate_r1_t *)first_buf;
         interrogate_r2_t   ir2;
         file_header_t      hdr;
-        list_response_t    resp_list;
+      list_response_t    resp_list;
         uint8_t            hmac_input[NONCE_SIZE + sizeof(list_response_t)];
         uint8_t            slot;
         uint16_t           send_len;
