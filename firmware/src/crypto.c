@@ -15,7 +15,7 @@
  * IV layout for a 96-bit nonce (standard GCM J0):
  *   iv[0..11]  = nonce (copied from caller)
  *   iv[12..14] = 0x00
- *   iv[15]     = 0x01  ← counter = 1 (big-endian byte order)
+ *   iv[15]     = 0x01  <- counter = 1 (big-endian byte order)
  *   The ARM reads iv[12..15] as a little-endian uint32, giving IV3 = 0x01000000.
  *
  * Data path (CPU polling, DMA disabled):
@@ -35,6 +35,25 @@
  *   The tag comparison itself uses double-evaluated secure_compare() that
  *   mirrors hmac_verify()'s fault hardening: both evaluations must agree or
  *   security_halt() fires.
+ *
+ * FIX SCA2 (MEDIUM): random_delay() is now called inside hmac_sha256()
+ *   immediately before wc_HmacSetKey().  wc_HmacSetKey() is where wolfcrypt
+ *   computes key XOR ipad and feeds it into the first SHA-256 compression —
+ *   the exact operation targeted by CPA.  Placing jitter here desynchronises
+ *   every HMAC callsite automatically: PIN verification, handshake
+ *   sender_auth / recv_auth, interrogate auth, and PERMISSION_MAC generation
+ *   all benefit without any changes to commands.c or security.c.
+ *
+ *   Prior state: random_delay() covered AES key loads (both encrypt and
+ *   decrypt) and PIN HMAC (via check_pin_cmp).  The handshake and
+ *   interrogate HMAC calls in commands.c had no jitter, leaving
+ *   TRANSFER_AUTH_KEY exposed to CPA against chosen-challenge inputs on the
+ *   LISTEN interface.
+ *
+ *   hmac_verify() already calls hmac_sha256() twice with a random_delay()
+ *   between passes; each inner call now adds a second independent jitter
+ *   before the key schedule.  This further raises the trace count required
+ *   for a successful CPA attack.
  *
  * SCA: random_delay() before key load in both encrypt and decrypt.
  *
@@ -62,8 +81,8 @@
 #define AES_BLOCK_BYTES     16U
 
 /*
- * Poll budget: AES-256 takes ~81 cycles (~2.5 µs at 32 MHz).
- * 100 000 iterations ≈ 3 ms at -O0 — far above real hardware latency.
+ * Poll budget: AES-256 takes ~81 cycles (~2.5 us at 32 MHz).
+ * 100 000 iterations ~= 3 ms at -O0 — far above real hardware latency.
  * security_halt() fires on timeout to prevent silent hangs.
  */
 #define AESADV_POLL_LIMIT   100000U
@@ -72,7 +91,7 @@
 /* -----------------------------------------------------------------------
  * aesadv_reset_and_enable — hardware-reset then power-enable AESADV.
  *
- * TI SDK init pattern: reset → enablePower → settle delay.
+ * TI SDK init pattern: reset -> enablePower -> settle delay.
  * The reset clears key registers, CTRL, IV, TAG, and DMA_HS.
  * The 1 ms settle is required — without it, INPUT_RDY never asserts.
  * ---------------------------------------------------------------------- */
@@ -157,7 +176,6 @@ static void feed_aad_blocks(const uint8_t *aad, size_t aad_len)
 
         poll_input_ready();
         DL_AESADV_loadInputDataAligned(AESADV, in_block);
-        /* No output read for AAD blocks. */
     }
 
     secure_zero(in_block, sizeof(in_block));
@@ -421,6 +439,13 @@ int aes_gcm_decrypt(const uint8_t *key,
  *
  * Computes HMAC(key, data || domain) via two wc_HmacUpdate calls so no
  * temporary concatenation buffer is needed on the stack.
+ *
+ * FIX SCA2 (MEDIUM): random_delay() is called immediately before
+ *   wc_HmacSetKey().  wc_HmacSetKey() is the first key-dependent operation:
+ *   it XORs the key with ipad and feeds the result into the SHA-256
+ *   compression function.  This is the leakage point targeted by CPA.
+ *   Placing jitter here covers every callsite — PIN, handshake auth,
+ *   interrogate auth — without modifying any caller.
  * ---------------------------------------------------------------------- */
 int hmac_sha256(const uint8_t *key,
                 const uint8_t *data, size_t data_len,
@@ -435,6 +460,8 @@ int hmac_sha256(const uint8_t *key,
 
     ret = wc_HmacInit(&ctx, NULL, INVALID_DEVID);
     if (ret != 0) { return -1; }
+
+    random_delay();   /* SCA2: jitter before key XOR ipad compression */
 
     ret = wc_HmacSetKey(&ctx, WC_SHA256, key, HMAC_SIZE);
     if (ret != 0) { goto hmac_fail; }
@@ -463,6 +490,8 @@ hmac_fail:
  * hmac_verify — constant-time HMAC-SHA256 verification, glitch-hardened.
  *
  * Computes MAC twice with random_delay() between passes.
+ * Each inner hmac_sha256() call independently jitters before the key
+ * schedule (FIX SCA2), so each pass produces an independently timed trace.
  * Halts on pass disagreement (fault detection).
  * ---------------------------------------------------------------------- */
 bool hmac_verify(const uint8_t *key,
@@ -490,7 +519,7 @@ bool hmac_verify(const uint8_t *key,
         return false;
     }
 
-    /* Passes must produce identical MACs; disagreement → fault. */
+    /* Passes must produce identical MACs; disagreement -> fault. */
     if (!secure_compare(mac1, mac2, HMAC_SIZE)) {
         secure_zero(mac1, sizeof(mac1));
         secure_zero(mac2, sizeof(mac2));
