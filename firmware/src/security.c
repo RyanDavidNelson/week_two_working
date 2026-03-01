@@ -8,6 +8,14 @@
  * the 2026 MITRE eCTF competition, and may not meet MITRE standards for
  * quality. Use this code at your own risk!
  *
+ * FIX SCA1 (MEDIUM): random_delay() is now called inside check_pin_cmp()
+ *   immediately before hmac_sha256(PIN_KEY, ...).  The TRNG-sourced jitter
+ *   desynchronises power traces collected across multiple PIN attempts,
+ *   raising the trace count required for a CPA attack on the SHA-256
+ *   compression of (PIN_KEY ^ ipad) from O(hundreds) toward O(tens-of-thousands).
+ *   SECURE_PIN_CHECK calls check_pin_cmp() twice per attempt, so each
+ *   attempt produces two independently jittered traces — further raising cost.
+ *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 
@@ -56,21 +64,10 @@ void delay_ms(uint32_t ms)
 
 void random_delay(void)
 {
-    /* 0–~4 ms jitter from one TRNG byte.  Kept for future use but no longer
-     * called on any hot path — double-glitch is out of scope, and timing
-     * analysis is handled by the XOR accumulator + wolfcrypt bitsliced AES. */
+    /* 0–~4 ms jitter from one TRNG byte.
+     * Called before every PIN HMAC evaluation (FIX SCA1) and before
+     * AES key loads to desynchronise power traces. */
     uint32_t jitter = (uint32_t)(trng_read_byte() & 0x7F) * (CYCLES_PER_MS / 32);
-    delay_cycles(jitter);
-}
-
-void random_delay_wide(void)
-{
-    /* 0–~20 ms jitter for SCA pre-key-load desynchronisation.
-     * Two TRNG bytes → 16-bit value; range ~0–640k cycles ≈ 0–20 ms.
-     * Wider window means CPA requires proportionally more traces. */
-    uint32_t lo     = (uint32_t)trng_read_byte();
-    uint32_t hi     = (uint32_t)trng_read_byte();
-    uint32_t jitter = ((hi << 8) | lo) * (CYCLES_PER_MS / 3277);
     delay_cycles(jitter);
 }
 
@@ -173,12 +170,12 @@ bool secure_compare(const void *a, const void *b, size_t len)
 /*
  * check_pin_cmp — single-pass HMAC-based PIN check, no brute-force penalty.
  *
- * Receives the PIN as PIN_LENGTH ASCII hex bytes exactly as the host sent
- * them (e.g. "1a2b3c").  Computes HMAC(PIN_KEY, pin || "pin") and
- * constant-time compares with PIN_HMAC stored in secrets.c.
+ * FIX SCA1: random_delay() called immediately before hmac_sha256(PIN_KEY, ...)
+ * to desynchronise power traces at the SHA-256 inner compression block
+ * (PIN_KEY ^ ipad).  SECURE_PIN_CHECK invokes this function twice per attempt,
+ * so each attempt produces two independently jittered traces.
  *
- * Never call this directly from a command handler — always use check_pin(),
- * which double-evaluates and applies the 5-second failure penalty.
+ * Never call directly — always use SECURE_PIN_CHECK or check_pin().
  */
 bool check_pin_cmp(const unsigned char *pin)
 {
@@ -186,6 +183,8 @@ bool check_pin_cmp(const unsigned char *pin)
     bool    result;
 
     if (pin == NULL) { return false; }
+
+    random_delay();   /* SCA1 fix: jitter before key-dependent SHA-256 */
 
     if (hmac_sha256(PIN_KEY,
                     pin, PIN_LENGTH,
@@ -201,13 +200,10 @@ bool check_pin_cmp(const unsigned char *pin)
 }
 
 /*
- * check_pin — double-pass check_pin_cmp with no random delay between passes.
+ * check_pin — double-pass check_pin_cmp with 5-second failure penalty.
  *
- * The double-pass catches any single fault injection that flips the result of
- * one evaluation; both passes must agree or we halt.  random_delay() between
- * passes is not needed because double-glitch attacks are out of scope.
- *
- * Applies 5-second penalty on wrong PIN; zeros pin buffer on every exit path.
+ * Per-call jitter is now handled inside check_pin_cmp() (FIX SCA1).
+ * No random_delay() between passes — double-glitch is out of scope.
  */
 bool check_pin(unsigned char *pin)
 {
@@ -215,7 +211,7 @@ bool check_pin(unsigned char *pin)
     volatile bool r2;
 
     r1 = check_pin_cmp(pin);
-    r2 = check_pin_cmp(pin);   /* no random_delay — double-glitch out of scope */
+    r2 = check_pin_cmp(pin);
 
     secure_zero(pin, PIN_LENGTH);
 
@@ -233,11 +229,6 @@ bool check_pin(unsigned char *pin)
 
 /*
  * validate_permission — double-pass local permission check.
- *
- * Scans global_permissions[] twice without random_delay between passes.
- * A single fault injection that flips found_pass1 but not found_pass2 (or
- * vice-versa) is caught by the agreement check; security_halt() fires.
- * random_delay() removed — double-glitch is out of scope.
  *
  * Loop counter i in [0, PERM_COUNT); terminates when i == PERM_COUNT.
  * Loop counter j in [0, PERM_COUNT); terminates when j == PERM_COUNT.
@@ -263,7 +254,7 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
         if (group_match && has_perm) { found_pass1 = true; }
     }
 
-    /* Second pass — no random_delay between passes. */
+    /* Second pass — no random_delay between; double-glitch out of scope. */
     for (j = 0; j < PERM_COUNT; j++) {
         bool group_match = (global_permissions[j].group_id == group_id);
         bool has_perm    = false;
@@ -278,7 +269,7 @@ bool validate_permission(uint16_t group_id, permission_enum_t perm)
         if (group_match && has_perm) { found_pass2 = true; }
     }
 
-    /* Passes must agree; disagreement indicates a fault injection attempt. */
+    /* Passes must agree; disagreement indicates fault injection. */
     if ((bool)found_pass1 != (bool)found_pass2) {
         security_halt();
     }

@@ -27,14 +27,8 @@
  *   All commands are sequential on bare metal; members never overlap in use.
  *
  *   RECEIVE FIX: receive_r4_t was formerly 8273 B on the stack of receive().
- *   When receive() called secure_write_file() (which allocates file_t = 8277 B),
- *   the combined stack reached ~17.25 KB, overflowing the ~15.8 KB budget and
- *   causing a hard fault after writing to flash.
- *   Fix: receive R4 into s_work.rcv (static), save the 81-byte header to
- *   small stack variables, decrypt in-place (wolfcrypt AES-GCM supports
- *   in == out for CTR-based operation), then call secure_write_file with
- *   s_work.rcv.ciphertext as the plaintext source.  receive()'s stack frame
- *   is ~350 B at the secure_write_file call site.
+ *   When receive() called secure_write_file() (file_t = 8277 B), combined
+ *   stack reached ~17.25 KB — overflow.  Fix: receive into s_work.rcv (static).
  *
  * Key usage:
  *   STORAGE_KEY       — at-rest AES-GCM (via secure_{read,write}_file)
@@ -42,13 +36,26 @@
  *   TRANSFER_AUTH_KEY — all HMAC challenge-response and permission MAC
  *   PIN_KEY           — PIN verification via SECURE_PIN_CHECK
  *
- * FIX #3: write() now validates name AFTER the PIN check, not before.
- *   Previously an attacker could probe name field validity (printable ASCII,
- *   null-terminated within 32 bytes) without supplying a PIN.  All other
- *   structural checks (slot, contents_len, packet length) are kept before
- *   the PIN because they guard against malformed packets that cannot
- *   succeed regardless of credentials.
+ * FIX FI1 (HIGH): Every `if (!ok1)` that follows a SECURE_PIN_CHECK or
+ *   SECURE_BOOL_CHECK has been changed to `if (!(ok1 & ok2))`.
  *
+ *   Why: SECURE_BOOL_CHECK/SECURE_PIN_CHECK guarantee ok1 == ok2 on normal
+ *   paths (or halt on disagreement).  The subsequent branch `if (!ok1)` is a
+ *   single instruction — a Chip Whisperer voltage glitch can skip or mispredict
+ *   it, bypassing the check entirely even though the macro detected nothing.
+ *
+ *   `if (!(ok1 & ok2))` requires two independent volatile reads from separate
+ *   stack locations.  A single glitch that corrupts ok1's load cannot
+ *   simultaneously corrupt ok2's load; AND'ing them means a glitch that forces
+ *   ok1 high while ok2 stays low (correct) still produces !(1 & 0) = true,
+ *   keeping the guard active.  The attacker now needs to win two simultaneous
+ *   glitches (double-glitch), which is explicitly out of scope.
+ *
+ * FIX P2 (LOW): interrogate() now bounds-checks r2.list.n_files against
+ *   list_data_len before forwarding to the host, preventing a compromised
+ *   peer from triggering host-side OOB reads with a crafted n_files value.
+ *
+ * FIX #3: write() validates name AFTER the PIN check.
  * FIX #5: All print_debug() calls removed from production build.
  *
  * @copyright Copyright (c) 2026 The MITRE Corporation
@@ -70,20 +77,12 @@
  * Shared static work buffer — one command runs at a time on bare metal.
  *
  *   .plain[]  8192 B — plaintext staging for listen()/RECEIVE_MSG
- *             (storage-decrypt output before transfer-re-encrypt)
- *
  *   .rsp{}    8224 B — read response: name(32) + contents(8192)
- *             Avoids placing read_response_t on the stack alongside file_t
- *             inside secure_read_file(), which would exceed the stack budget.
+ *   .rcv      8273 B — R4 wire buffer for receive() initiator
  *
- *   .rcv      8273 B — R4 wire buffer for receive() initiator.
- *             After aes_gcm_decrypt(..., in=.rcv.ciphertext, out=.rcv.ciphertext),
- *             the ciphertext field holds the decrypted plaintext and is passed
- *             directly to secure_write_file().  The field name is a naming
- *             artifact; after in-place decrypt it contains plaintext.
- *
- * Lifetimes are strictly non-overlapping: the main loop dispatches one
- * command, waits for it to return, then dispatches the next.
+ * After aes_gcm_decrypt(..., in=.rcv.ciphertext, out=.rcv.ciphertext),
+ * the ciphertext field holds the decrypted plaintext.  Field name is a
+ * naming artifact; after in-place decrypt it contains plaintext.
  */
 static union {
     uint8_t plain[MAX_CONTENTS_SIZE];        /* 8192 B — listen() plaintext staging */
@@ -100,7 +99,7 @@ static union {
  **********************************************************/
 
 /* Serialize one permission: group_id(2 LE) || read(1) || write(1) || receive(1).
- * dst must have PERM_SERIAL_SIZE bytes available. */
+ * out must have PERM_SERIAL_SIZE bytes available. */
 static void serialize_one_perm(const group_permission_t *p, uint8_t *out)
 {
     out[0] = (uint8_t)(p->group_id & 0xFF);
@@ -128,11 +127,11 @@ static void serialize_permissions(const group_permission_t *src,
  * p[2]=read, p[3]=write, p[4]=receive must each be exactly 0 or 1.
  * Loop counter i in [0, perm_count); terminates when i == perm_count.
  */
-static bool validate_perm_bytes(const uint8_t *perm_bytes, uint8_t perm_count)
+static bool validate_perm_bytes(const uint8_t *perms, uint8_t perm_count)
 {
     uint8_t i;
     for (i = 0; i < perm_count; i++) {
-        const uint8_t *p = perm_bytes + (size_t)i * PERM_SERIAL_SIZE;
+        const uint8_t *p = perms + (size_t)i * PERM_SERIAL_SIZE;
         if (!validate_bool(p[2]) || !validate_bool(p[3]) || !validate_bool(p[4])) {
             return false;
         }
@@ -141,62 +140,38 @@ static bool validate_perm_bytes(const uint8_t *perm_bytes, uint8_t perm_count)
 }
 
 /*
- * Verify a peer's PERMISSION_MAC.
- * MAC = HMAC(TRANSFER_AUTH_KEY, perm_count_byte || perm_bytes || "permission").
- */
-static bool verify_perm_mac(uint8_t perm_count,
-                             const uint8_t *perm_bytes,
-                             const uint8_t *mac)
-{
-    uint8_t hmac_input[1 + MAX_PERMS * PERM_SERIAL_SIZE];
-    uint8_t computed[HMAC_SIZE];
-    bool    result;
-
-    hmac_input[0] = perm_count;
-    memcpy(hmac_input + 1, perm_bytes, (size_t)perm_count * PERM_SERIAL_SIZE);
-
-    if (hmac_sha256(TRANSFER_AUTH_KEY,
-                    hmac_input,
-                    1u + (size_t)perm_count * PERM_SERIAL_SIZE,
-                    HMAC_DOMAIN_PERMISSION,
-                    computed) != 0) {
-        secure_zero(computed, sizeof(computed));
-        return false;
-    }
-
-    result = secure_compare(computed, mac, HMAC_SIZE);
-    secure_zero(computed, sizeof(computed));
-    secure_zero(hmac_input, sizeof(hmac_input));
-    return result;
-}
-
-/*
- * Check whether the serialized permissions contain RECEIVE for group_id.
+ * Check if serialized permissions grant RECEIVE for a given group_id.
  * Loop counter i in [0, perm_count); terminates when i == perm_count.
  */
-static bool perm_bytes_has_receive(const uint8_t *perm_bytes,
-                                   uint8_t        perm_count,
-                                   uint16_t       group_id)
+static bool perm_bytes_has_receive(const uint8_t *perms, uint8_t perm_count,
+                                   uint16_t group_id)
 {
     uint8_t i;
     for (i = 0; i < perm_count; i++) {
-        const uint8_t *p = perm_bytes + (size_t)i * PERM_SERIAL_SIZE;
-        uint16_t gid = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-        if (gid == group_id && p[4] == 1u) {
-            return true;
-        }
+        const uint8_t *p   = perms + (size_t)i * PERM_SERIAL_SIZE;
+        uint16_t       gid = (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+        if (gid == group_id && p[4] == 1u) { return true; }
     }
     return false;
 }
 
-
-/**********************************************************
- ******************** LIST HELPERS ************************
- **********************************************************/
+/*
+ * Verify the PERMISSION_MAC attached to a received permission blob.
+ * PERMISSION_MAC = HMAC(TRANSFER_AUTH_KEY, count || perms || "permission").
+ */
+static bool verify_perm_mac(uint8_t perm_count, const uint8_t *perms,
+                             const uint8_t *mac)
+{
+    uint8_t input[1 + MAX_PERMS * PERM_SERIAL_SIZE];
+    input[0] = perm_count;
+    memcpy(input + 1, perms, (size_t)perm_count * PERM_SERIAL_SIZE);
+    return hmac_verify(TRANSFER_AUTH_KEY,
+                       input, 1 + (size_t)perm_count * PERM_SERIAL_SIZE,
+                       HMAC_DOMAIN_PERMISSION, mac);
+}
 
 /*
- * Build file list for the LIST response.
- *
+ * generate_list_files — read all flash slots and populate file_list.
  * Loop counter slot in [0, MAX_FILE_COUNT); terminates when slot == MAX_FILE_COUNT.
  *
  * NOTE: reads the full file_t once per slot — does NOT call is_slot_in_use()
@@ -247,7 +222,15 @@ int list(uint16_t pkt_len, uint8_t *buf)
 
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-    if (!ok1) {
+
+    /*
+     * FI1 fix: `if (!(ok1 & ok2))` instead of `if (!ok1)`.
+     * SECURE_PIN_CHECK guarantees ok1 == ok2 or halts, so in normal
+     * operation ok1 & ok2 == ok1.  Under a single glitch that forces ok1's
+     * volatile load to true while ok2's load stays false (correct value),
+     * the AND keeps the guard active: !(true & false) = true → reject.
+     */
+    if (!(ok1 & ok2)) {
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
@@ -287,7 +270,7 @@ int read(uint16_t pkt_len, uint8_t *buf)
 
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-    if (!ok1) {
+    if (!(ok1 & ok2)) {   /* FI1 fix */
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
@@ -300,7 +283,7 @@ int read(uint16_t pkt_len, uint8_t *buf)
     }
 
     SECURE_BOOL_CHECK(ok1, ok2, validate_permission(pre_gid, PERM_READ));
-    if (!ok1) {
+    if (!(ok1 & ok2)) {   /* FI1 fix */
         print_error("Operation failed");
         return -1;
     }
@@ -337,19 +320,17 @@ int read(uint16_t pkt_len, uint8_t *buf)
 
 /*
  * Byte length of the fixed header portion of write_command_t.
- * The host sends header + contents_len bytes of payload, not the full struct.
- * Checking sizeof(write_command_t) would reject every real file.
+ * The host sends header + contents_len bytes, not the full struct.
  */
 #define WRITE_CMD_HEADER_SIZE ((uint16_t)offsetof(write_command_t, contents))
 
 /*
  * WRITE — permission enforced; overwrites existing slot content if occupied.
  *
- * FIX #3: validate_name() is now called AFTER the PIN check.
- *   Structural guards (slot, contents_len, packet length) that reject
- *   malformed packets regardless of credentials remain before the PIN.
- *   Moving validate_name() after the PIN eliminates the pre-auth oracle
- *   that allowed an attacker to probe name field validity without a PIN.
+ * FIX #3: validate_name() is called AFTER the PIN check.
+ *   Structural guards (slot, contents_len, packet length) remain before
+ *   the PIN because they reject malformed packets regardless of credentials.
+ *   Moving validate_name() after the PIN eliminates the pre-auth oracle.
  */
 int write(uint16_t pkt_len, uint8_t *buf)
 {
@@ -377,7 +358,7 @@ int write(uint16_t pkt_len, uint8_t *buf)
     /* Step 2: authenticate before inspecting any business-logic fields. */
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-    if (!ok1) {
+    if (!(ok1 & ok2)) {   /* FI1 fix */
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
@@ -390,7 +371,7 @@ int write(uint16_t pkt_len, uint8_t *buf)
     }
 
     SECURE_BOOL_CHECK(ok1, ok2, validate_permission(command->group_id, PERM_WRITE));
-    if (!ok1) {
+    if (!(ok1 & ok2)) {   /* FI1 fix */
         print_error("Operation failed");
         return -1;
     }
@@ -417,14 +398,10 @@ int write(uint16_t pkt_len, uint8_t *buf)
  * R3 → send recv_auth + own permissions + PERMISSION_MAC
  * R4 ← verify GCM tag; check OWN RECEIVE permission; write to write_slot
  *
- * STACK FIX: receive_r4_t (8273 B) now lives in s_work.rcv (static).
- * Formerly it was a local variable; when receive() called secure_write_file()
- * (which pushes file_t = 8277 B), the combined stack hit ~17.25 KB and
- * overflowed, causing a hard fault after writing to flash.
- *
+ * STACK FIX: receive_r4_t (8273 B) lives in s_work.rcv (static).
  * Approach: receive R4 into s_work.rcv, save the 81-byte header to small
- * stack variables, decrypt in-place (wolfcrypt AES-GCM CTR supports in==out),
- * then pass s_work.rcv.ciphertext (now holding plaintext) to secure_write_file.
+ * stack variables, decrypt in-place, then pass s_work.rcv.ciphertext
+ * (now holding plaintext) to secure_write_file.
  * receive()'s stack frame is ~350 B at the secure_write_file call site.
  */
 int receive(uint16_t pkt_len, uint8_t *buf)
@@ -440,14 +417,14 @@ int receive(uint16_t pkt_len, uint8_t *buf)
     size_t             transfer_aad_len;
     int                ret;
 
-    /* Saved R4 header fields — 81 bytes total, fits comfortably on the stack. */
-    uint8_t  saved_nonce[NONCE_SIZE];       /* 12 B */
-    uint8_t  saved_tag[TAG_SIZE];           /* 16 B */
-    uint16_t saved_contents_len;            /*  2 B */
-    uint8_t  saved_uuid[UUID_SIZE];         /* 16 B */
-    uint8_t  saved_slot;                    /*  1 B */
-    uint16_t saved_group_id;               /*  2 B */
-    char     saved_name[MAX_NAME_SIZE];     /* 32 B */
+    /* Saved R4 header fields (81 bytes total) — fits on stack. */
+    uint8_t  saved_nonce[NONCE_SIZE];
+    uint8_t  saved_tag[TAG_SIZE];
+    uint16_t saved_contents_len;
+    uint8_t  saved_uuid[UUID_SIZE];
+    uint8_t  saved_slot;
+    uint16_t saved_group_id;
+    char     saved_name[MAX_NAME_SIZE];
 
     if (pkt_len < sizeof(receive_command_t)) {
         print_error("Operation failed");
@@ -460,7 +437,7 @@ int receive(uint16_t pkt_len, uint8_t *buf)
 
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-    if (!ok1) {
+    if (!(ok1 & ok2)) {   /* FI1 fix */
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
@@ -548,8 +525,8 @@ int receive(uint16_t pkt_len, uint8_t *buf)
     }
 
     /*
-     * Save the 81-byte R4 header to stack variables so that s_work.rcv can be
-     * used as both the ciphertext source and plaintext destination (in-place
+     * Save the 81-byte R4 header to stack variables so that s_work.rcv can
+     * be used as both the ciphertext source and plaintext destination (in-place
      * decrypt).  wolfcrypt AES-GCM verifies the tag over the original ciphertext
      * before overwriting, so in == out is safe.
      */
@@ -570,8 +547,7 @@ int receive(uint16_t pkt_len, uint8_t *buf)
 
     /*
      * In-place GCM decrypt: source and destination are both s_work.rcv.ciphertext.
-     * After this call, s_work.rcv.ciphertext holds the plaintext.
-     * The field name is a naming artifact — post-decrypt it contains plaintext.
+     * After this call s_work.rcv.ciphertext holds the plaintext.
      */
     ret = aes_gcm_decrypt(TRANSFER_KEY, saved_nonce,
                           transfer_aad, transfer_aad_len,
@@ -593,9 +569,15 @@ int receive(uint16_t pkt_len, uint8_t *buf)
         return -1;
     }
 
-    /* Verify OUR own RECEIVE permission for this file's group. */
+    /*
+     * Verify OUR own RECEIVE permission for this file's group.
+     * P1 note: permission check structurally follows decryption because
+     * saved_group_id is authenticated inside the GCM ciphertext and cannot
+     * be verified until after the tag check passes.  Plaintext is zeroed
+     * on failure, and the FI1 fix below hardens the branch.
+     */
     SECURE_BOOL_CHECK(ok1, ok2, validate_permission(saved_group_id, PERM_RECEIVE));
-    if (!ok1) {
+    if (!(ok1 & ok2)) {   /* FI1 fix: AND both volatile reads */
         secure_zero(&s_work.rcv, sizeof(s_work.rcv));
         secure_zero(saved_uuid,  UUID_SIZE);
         secure_zero(saved_name,  MAX_NAME_SIZE);
@@ -632,6 +614,13 @@ int receive(uint16_t pkt_len, uint8_t *buf)
  *
  * R1 → send challenge + auth + own permissions
  * R2 ← verify resp_auth; forward filtered list to host
+ *
+ * FIX P2 (LOW): r2.list.n_files is bounds-checked against list_data_len
+ * before the list is forwarded to the host.  A compromised peer (sharing
+ * TRANSFER_AUTH_KEY) could craft a valid HMAC over a packet where n_files
+ * claims more entries than the data contains, causing the host tool to
+ * read past the end of the list buffer.  The check below ensures
+ * n_files * sizeof(file_metadata_t) + sizeof(uint32_t) <= list_data_len.
  */
 int interrogate(uint16_t pkt_len, uint8_t *buf)
 {
@@ -650,7 +639,7 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
 
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-    if (!ok1) {
+    if (!(ok1 & ok2)) {   /* FI1 fix */
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
@@ -706,6 +695,31 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
     secure_zero(hmac_input, sizeof(hmac_input));
     secure_zero(&r1, sizeof(r1));
 
+    /*
+     * FIX P2: bounds-check n_files before forwarding list to host.
+     *
+     * A crafted n_files value larger than what list_data_len can hold would
+     * cause the host-side parser to read past the actual data.  Enforce that
+     * the serialized list size implied by n_files fits within list_data_len.
+     *
+     * Required: sizeof(uint32_t) + n_files * sizeof(file_metadata_t) <= list_data_len
+     */
+    if (list_data_len < sizeof(uint32_t)) {
+        secure_zero(&r2, sizeof(r2));
+        print_error("Operation failed");
+        return -1;
+    }
+    {
+        uint32_t n_files     = r2.list.n_files;
+        uint32_t needed_len  = (uint32_t)sizeof(uint32_t)
+                               + n_files * (uint32_t)sizeof(file_metadata_t);
+        if (n_files > MAX_FILE_COUNT || needed_len > (uint32_t)list_data_len) {
+            secure_zero(&r2, sizeof(r2));
+            print_error("Operation failed");
+            return -1;
+        }
+    }
+
     write_packet(CONTROL_INTERFACE, INTERROGATE_MSG, &r2.list, list_data_len);
     secure_zero(&r2, sizeof(r2));
     return 0;
@@ -718,18 +732,9 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
  *
  * PHASE 1A FIX: write_packet(CONTROL_INTERFACE, LISTEN_MSG, ...) is sent at
  * the very top of this function, BEFORE blocking on TRANSFER_INTERFACE.
- * The test framework needs the LISTEN ack to know the board is ready so it
- * can proceed to fire the INTERROGATE or RECEIVE at the peer.  The original
- * design held the ack until after the full UART1 exchange, which deadlocked
- * both boards because neither side could start.
  *
- * STALE DRAIN: after acking the host, we drain any bytes left in the UART1
- * FIFO from a prior aborted exchange before blocking on the peer's R1.
- * Without this, a leftover '%I' framing byte from a failed interrogate could
- * be misread as the start of R1 on the next listen call.
- *
- * uart_drain_rx() is non-blocking — it only discards bytes already in the
- * FIFO right now, so it cannot accidentally consume the peer's fresh R1.
+ * STALE DRAIN: drain any bytes left in the UART1 FIFO from a prior aborted
+ * exchange before blocking on the peer's R1.  uart_drain_rx() is non-blocking.
  *
  * RECEIVE_MSG stack peak:
  *   union u { file_t stored; receive_r4_t fdata } = 8277 B
@@ -738,20 +743,9 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
  *
  * INTERROGATE_MSG stack peak:
  *   file_header_t hdr(55) + ir2(316) + resp_list(284) + hmac_input(296) ≈ 1 KB.
- *   file_t tmp replaced by file_header_t hdr — eliminates 8277-byte stack overflow.
  *
- * NOTE: RECEIVE_MSG branch does NOT call is_slot_in_use() separately.
- *   That function allocates file_t probe (8277 B) while union u is already
- *   live on the stack — pushing total to ~17 KB and overflowing.
- *   Instead, read_file() is called once and in_use is checked inline.
- *
- * DESYNC FIX: every error path that fires AFTER R2 was sent (i.e. the
- * receiver is already blocking on R4) sends a best-effort ERROR_MSG on
- * TRANSFER_INTERFACE before returning.  This lets receive() fail fast on
- * cmd != RECEIVE_MSG instead of timing out, allowing it to report the error
- * on CONTROL_INTERFACE before the test framework's next WRITE deadline.
- * Without this, a permission rejection left the receiver stuck for the full
- * UART timeout, causing a WRITE serial timeout and UART desync.
+ * DESYNC FIX: every error path that fires AFTER R2 was sent sends a
+ * best-effort ERROR_MSG on TRANSFER_INTERFACE before returning.
  */
 int listen(uint16_t pkt_len, uint8_t *buf)
 {
@@ -762,21 +756,13 @@ int listen(uint16_t pkt_len, uint8_t *buf)
     (void)pkt_len;
     (void)buf;
 
-    /* Ack the host immediately so the test framework can fire the peer command
-     * without waiting for us to complete the UART1 exchange first. */
+    /* Ack the host immediately so the test framework can fire the peer command. */
     write_packet(CONTROL_INTERFACE, LISTEN_MSG, NULL, 0);
 
-    /* Flush stale bytes already sitting in the RX FIFO from a prior exchange.
-     * uart_drain_rx is non-blocking — it only discards bytes present NOW,
-     * so it cannot accidentally consume the peer's fresh R1 header. */
     (void)uart_drain_rx(TRANSFER_INTERFACE, MAX_SYNC_DISCARD);
 
     memset(first_buf, 0, sizeof(first_buf));
     if (read_packet(TRANSFER_INTERFACE, &cmd, first_buf, &first_len) != MSG_OK) {
-        /* Timeout or framing error — peer never sent R1.
-         * Host already received its LISTEN ack and exited; do NOT call
-         * print_error() here — write_packet(CONTROL_INTERFACE, ...) would
-         * block forever waiting for an ACK from a disconnected host. */
         return -1;
     }
 
@@ -784,11 +770,9 @@ int listen(uint16_t pkt_len, uint8_t *buf)
     /* RECEIVE_MSG — sender (responder) side                               */
     /* ================================================================== */
     if (cmd == RECEIVE_MSG) {
-        volatile bool ok1, ok2;
+        volatile bool ok1, ok2;   /* unused in listen() sender path — kept for future FI hardening */
 
-        /* Union: file_t and receive_r4_t share 8277 B of stack.
-         * stored arm is live while we read the file and save metadata.
-         * fdata arm is live when building the outgoing R4 packet. */
+        /* Union: file_t and receive_r4_t share 8277 B of stack. */
         union {
             file_t       stored;
             receive_r4_t fdata;
@@ -811,19 +795,16 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         size_t        aad_len;
         int           ret;
 
-        if (first_len != sizeof(receive_r1_t)) {
-            return -1;
-        }
-        if (!validate_slot(r1->slot)) {
-            return -1;
-        }
+        (void)ok1; (void)ok2;   /* suppress unused-variable warnings */
+
+        if (first_len != sizeof(receive_r1_t)) { return -1; }
+        if (!validate_slot(r1->slot))          { return -1; }
 
         slot_req = r1->slot;
         memcpy(recv_chal, r1->recv_chal, NONCE_SIZE);
 
         /* Load encrypted file from flash — check in_use inline.
-         * Do NOT call is_slot_in_use() here: that would put a second
-         * file_t (8277 B) on the stack while union u is already live. */
+         * Do NOT call is_slot_in_use() here: second file_t on stack overflows. */
         memset(&u.stored, 0, sizeof(u.stored));
         if (read_file(slot_req, &u.stored) != 0 ||
             u.stored.in_use != FILE_IN_USE ||
@@ -861,9 +842,7 @@ int listen(uint16_t pkt_len, uint8_t *buf)
             return -1;
         }
 
-        /* Decrypt stored file into s_work.plain with STORAGE_KEY before
-         * sending R2 — allows us to send both R2 and R4 without keeping
-         * the encrypted file on the stack. */
+        /* Decrypt stored file into s_work.plain with STORAGE_KEY. */
         aad_len = build_storage_aad(slot_req, saved_uuid,
                                     saved_group_id, saved_name,
                                     storage_aad);
@@ -874,7 +853,7 @@ int listen(uint16_t pkt_len, uint8_t *buf)
                               u.stored.tag, s_work.plain);
 
         secure_zero(storage_aad, sizeof(storage_aad));
-        secure_zero(&u.stored, sizeof(u.stored));   /* stored arm done */
+        secure_zero(&u.stored, sizeof(u.stored));
 
         if (ret != 0) {
             secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
@@ -890,10 +869,9 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         secure_zero(&r2, sizeof(r2));
 
         /*
-         * R2 has been delivered — receiver is now committed to waiting for R4.
-         * Every error path from this point MUST send ERROR_MSG on
-         * TRANSFER_INTERFACE before returning so receive() can fail fast
-         * instead of timing out, preventing UART desync on the control side.
+         * R2 delivered — receiver is now committed to waiting for R4.
+         * Every error path from here MUST send ERROR_MSG on TRANSFER_INTERFACE
+         * to prevent UART desync on the control side.
          */
 
         /* ---- R3: receive and verify receiver auth + permissions ---- */
@@ -929,8 +907,7 @@ int listen(uint16_t pkt_len, uint8_t *buf)
             return -1;
         }
 
-        /* Receiver must have RECEIVE permission for this file's group.
-         * Loop counter checked inside perm_bytes_has_receive. */
+        /* Receiver must have RECEIVE permission for this file's group. */
         if (!perm_bytes_has_receive(r3.perms, r3.perm_count, saved_group_id)) {
             secure_zero(recv_chal, NONCE_SIZE);
             secure_zero(send_chal, NONCE_SIZE);
@@ -942,7 +919,7 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         secure_zero(&r3, sizeof(r3));
 
         /* ---- R4: build and send encrypted file ---- */
-        memset(&u.fdata, 0, sizeof(u.fdata));    /* fdata arm now active */
+        memset(&u.fdata, 0, sizeof(u.fdata));
         if (generate_nonce(u.fdata.nonce) != 0) {
             secure_zero(recv_chal, NONCE_SIZE);
             secure_zero(send_chal, NONCE_SIZE);
@@ -1002,9 +979,7 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         uint8_t            slot;
         uint16_t           send_len;
 
-        if (first_len != sizeof(interrogate_r1_t)) {
-            return -1;
-        }
+        if (first_len != sizeof(interrogate_r1_t)) { return -1; }
 
         /* Validate requester permission MAC and auth. */
         if (!validate_perm_count(ir1->perm_count) ||
@@ -1018,7 +993,7 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         }
 
         /*
-         * Build the filtered file list.
+         * Build filtered file list.
          * Uses file_header_t hdr (55 B) per slot, NOT file_t (8277 B).
          * Loop counter slot in [0, MAX_FILE_COUNT); terminates at MAX_FILE_COUNT.
          */

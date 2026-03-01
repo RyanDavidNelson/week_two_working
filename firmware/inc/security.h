@@ -104,19 +104,9 @@ void delay_ms(uint32_t ms);
  *
  * Available for future use.  No longer called on any hot path —
  * double-glitch defence is out of scope and timing analysis is handled
- * by the XOR accumulator + wolfcrypt bitsliced AES.
+ * by the XOR accumulator.
  */
 void random_delay(void);
-
-/**
- * @brief Wide random jitter: 0–~20 ms from two TRNG bytes.
- *
- * Called in crypto.c before every wc_AesGcmSetKey() to slide the
- * key-schedule power signature across a larger trace window.  Wider
- * range means CPA requires proportionally more traces to average out.
- * Only used on the AES path; does not affect interrogate timing.
- */
-void random_delay_wide(void);
 
 /* ------------------------------------------------------------------ */
 /* Memory Functions                                                    */
