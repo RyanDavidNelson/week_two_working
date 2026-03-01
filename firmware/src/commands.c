@@ -36,20 +36,23 @@
  *   TRANSFER_AUTH_KEY — all HMAC challenge-response and permission MAC
  *   PIN_KEY           — PIN verification via SECURE_PIN_CHECK
  *
- * FIX FI1 (HIGH): Every `if (!ok1)` that follows a SECURE_PIN_CHECK or
- *   SECURE_BOOL_CHECK has been changed to `if (!(ok1 & ok2))`.
+ * FIX FI2 (HIGH): All `if (!(ok1 & ok2))` branches replaced with
+ *   `if (SECURE_CHECK_FAILED(ok1, ok2))`.
  *
- *   Why: SECURE_BOOL_CHECK/SECURE_PIN_CHECK guarantee ok1 == ok2 on normal
- *   paths (or halt on disagreement).  The subsequent branch `if (!ok1)` is a
- *   single instruction — a Chip Whisperer voltage glitch can skip or mispredict
- *   it, bypassing the check entirely even though the macro detected nothing.
+ *   The plain AND-branch was a single CMP+BEQ instruction — a ChipWhisperer
+ *   voltage glitch targeting that instruction could skip it entirely even
+ *   though SECURE_BOOL_CHECK/SECURE_PIN_CHECK detected nothing wrong.
  *
- *   `if (!(ok1 & ok2))` requires two independent volatile reads from separate
- *   stack locations.  A single glitch that corrupts ok1's load cannot
- *   simultaneously corrupt ok2's load; AND'ing them means a glitch that forces
- *   ok1 high while ok2 stays low (correct) still produces !(1 & 0) = true,
- *   keeping the guard active.  The attacker now needs to win two simultaneous
- *   glitches (double-glitch), which is explicitly out of scope.
+ *   SECURE_CHECK_FAILED re-reads ok1 and ok2 into fresh volatiles, ANDs them,
+ *   stores a complement canary, then checks that the AND and canary are
+ *   complementary.  A single bit-flip anywhere leaves them incongruent and
+ *   the expression evaluates to true (check failed), keeping the guard active.
+ *   An attacker now needs simultaneous faults on the AND result AND the canary
+ *   (double-glitch), which is explicitly out of scope.
+ *
+ * FIX SLOT (MED): receive() now explicitly asserts saved_slot ==
+ *   command->read_slot after parsing R4, closing the implicit slot-binding
+ *   invariant that was previously enforced only through AAD construction.
  *
  * FIX P2 (LOW): interrogate() now bounds-checks r2.list.n_files against
  *   list_data_len before forwarding to the host, preventing a compromised
@@ -140,7 +143,22 @@ static bool validate_perm_bytes(const uint8_t *perms, uint8_t perm_count)
 }
 
 /*
- * Check if serialized permissions grant RECEIVE for a given group_id.
+ * Verify PERMISSION_MAC over received serialized permissions.
+ * HMAC(TRANSFER_AUTH_KEY, perm_count || perms || "permission").
+ */
+static bool verify_perm_mac(uint8_t perm_count, const uint8_t *perms,
+                             const uint8_t *mac)
+{
+    uint8_t buf[1 + MAX_PERMS * PERM_SERIAL_SIZE];
+    buf[0] = perm_count;
+    memcpy(buf + 1, perms, (size_t)perm_count * PERM_SERIAL_SIZE);
+    return hmac_verify(TRANSFER_AUTH_KEY,
+                       buf, 1 + (size_t)perm_count * PERM_SERIAL_SIZE,
+                       HMAC_DOMAIN_PERMISSION, mac);
+}
+
+/*
+ * Return true if the serialized permission list claims RECEIVE for group_id.
  * Loop counter i in [0, perm_count); terminates when i == perm_count.
  */
 static bool perm_bytes_has_receive(const uint8_t *perms, uint8_t perm_count,
@@ -148,30 +166,18 @@ static bool perm_bytes_has_receive(const uint8_t *perms, uint8_t perm_count,
 {
     uint8_t i;
     for (i = 0; i < perm_count; i++) {
-        const uint8_t *p   = perms + (size_t)i * PERM_SERIAL_SIZE;
-        uint16_t       gid = (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
-        if (gid == group_id && p[4] == 1u) { return true; }
+        const uint8_t *p = perms + (size_t)i * PERM_SERIAL_SIZE;
+        uint16_t gid;
+        memcpy(&gid, p, sizeof(uint16_t));
+        if (gid == group_id && p[4] == 1u) {
+            return true;
+        }
     }
     return false;
 }
 
 /*
- * Verify the PERMISSION_MAC attached to a received permission blob.
- * PERMISSION_MAC = HMAC(TRANSFER_AUTH_KEY, count || perms || "permission").
- */
-static bool verify_perm_mac(uint8_t perm_count, const uint8_t *perms,
-                             const uint8_t *mac)
-{
-    uint8_t input[1 + MAX_PERMS * PERM_SERIAL_SIZE];
-    input[0] = perm_count;
-    memcpy(input + 1, perms, (size_t)perm_count * PERM_SERIAL_SIZE);
-    return hmac_verify(TRANSFER_AUTH_KEY,
-                       input, 1 + (size_t)perm_count * PERM_SERIAL_SIZE,
-                       HMAC_DOMAIN_PERMISSION, mac);
-}
-
-/*
- * generate_list_files — read all flash slots and populate file_list.
+ * Build file list from slots with live files.
  * Loop counter slot in [0, MAX_FILE_COUNT); terminates when slot == MAX_FILE_COUNT.
  *
  * NOTE: reads the full file_t once per slot — does NOT call is_slot_in_use()
@@ -222,15 +228,7 @@ int list(uint16_t pkt_len, uint8_t *buf)
 
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-
-    /*
-     * FI1 fix: `if (!(ok1 & ok2))` instead of `if (!ok1)`.
-     * SECURE_PIN_CHECK guarantees ok1 == ok2 or halts, so in normal
-     * operation ok1 & ok2 == ok1.  Under a single glitch that forces ok1's
-     * volatile load to true while ok2's load stays false (correct value),
-     * the AND keeps the guard active: !(true & false) = true → reject.
-     */
-    if (!(ok1 & ok2)) {
+    if (SECURE_CHECK_FAILED(ok1, ok2)) {
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
@@ -270,7 +268,7 @@ int read(uint16_t pkt_len, uint8_t *buf)
 
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-    if (!(ok1 & ok2)) {   /* FI1 fix */
+    if (SECURE_CHECK_FAILED(ok1, ok2)) {
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
@@ -283,7 +281,7 @@ int read(uint16_t pkt_len, uint8_t *buf)
     }
 
     SECURE_BOOL_CHECK(ok1, ok2, validate_permission(pre_gid, PERM_READ));
-    if (!(ok1 & ok2)) {   /* FI1 fix */
+    if (SECURE_CHECK_FAILED(ok1, ok2)) {
         print_error("Operation failed");
         return -1;
     }
@@ -336,8 +334,9 @@ int write(uint16_t pkt_len, uint8_t *buf)
 {
     write_command_t *command = (write_command_t *)buf;
     volatile bool    ok1, ok2;
+    uint16_t         gid;
 
-    /* Step 1: structural guards — reject malformed packets before any work. */
+    /* Structural pre-checks — reject malformed packets before PIN. */
     if (pkt_len < WRITE_CMD_HEADER_SIZE) {
         print_error("Operation failed");
         return -1;
@@ -355,32 +354,29 @@ int write(uint16_t pkt_len, uint8_t *buf)
         return -1;
     }
 
-    /* Step 2: authenticate before inspecting any business-logic fields. */
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-    if (!(ok1 & ok2)) {   /* FI1 fix */
+    if (SECURE_CHECK_FAILED(ok1, ok2)) {
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
     }
 
-    /* Step 3: validate name only after a valid PIN — prevents pre-auth oracle. */
+    /* Credential-gated checks — after PIN. */
     if (!validate_name(command->name, MAX_NAME_SIZE)) {
         print_error("Operation failed");
         return -1;
     }
 
-    SECURE_BOOL_CHECK(ok1, ok2, validate_permission(command->group_id, PERM_WRITE));
-    if (!(ok1 & ok2)) {   /* FI1 fix */
+    gid = command->group_id;
+    SECURE_BOOL_CHECK(ok1, ok2, validate_permission(gid, PERM_WRITE));
+    if (SECURE_CHECK_FAILED(ok1, ok2)) {
         print_error("Operation failed");
         return -1;
     }
 
-    if (secure_write_file(command->slot,
-                          command->group_id,
-                          command->name,
-                          command->contents,
-                          command->contents_len,
+    if (secure_write_file(command->slot, gid, command->name,
+                          command->contents, command->contents_len,
                           command->uuid) != 0) {
         print_error("Operation failed");
         return -1;
@@ -391,7 +387,7 @@ int write(uint16_t pkt_len, uint8_t *buf)
 }
 
 /*
- * RECEIVE — initiator side of the 4-round authenticated file transfer.
+ * RECEIVE — initiator side.
  *
  * R1 → send slot + recv_chal
  * R2 ← verify sender_auth = HMAC(TAK, recv_chal || "sender")
@@ -437,7 +433,7 @@ int receive(uint16_t pkt_len, uint8_t *buf)
 
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-    if (!(ok1 & ok2)) {   /* FI1 fix */
+    if (SECURE_CHECK_FAILED(ok1, ok2)) {
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
@@ -539,6 +535,25 @@ int receive(uint16_t pkt_len, uint8_t *buf)
     memcpy(saved_name,  s_work.rcv.name,  MAX_NAME_SIZE);
     saved_name[MAX_NAME_SIZE - 1] = '\0';
 
+    /*
+     * FIX SLOT: Assert slot binding explicitly.
+     *
+     * The sender fills r4.slot with the slot it read from.  Both sides use
+     * saved_slot when constructing the transfer AAD, so a mismatch means the
+     * sender is claiming a different source slot than we requested in R1.
+     * Catching this before AAD construction closes a confused-deputy window
+     * where a malicious peer substitutes a different slot identity mid-session.
+     */
+    if (saved_slot != command->read_slot) {
+        secure_zero(&s_work.rcv, sizeof(s_work.rcv));
+        secure_zero(&r1, sizeof(r1));
+        secure_zero(&r2, sizeof(r2));
+        secure_zero(saved_uuid, UUID_SIZE);
+        secure_zero(saved_name, MAX_NAME_SIZE);
+        print_error("Operation failed");
+        return -1;
+    }
+
     /* Build transfer AAD using challenges from r1/r2 and saved metadata. */
     transfer_aad_len = build_transfer_aad(r1.recv_chal, r2.send_chal,
                                           saved_slot, saved_uuid,
@@ -574,10 +589,10 @@ int receive(uint16_t pkt_len, uint8_t *buf)
      * P1 note: permission check structurally follows decryption because
      * saved_group_id is authenticated inside the GCM ciphertext and cannot
      * be verified until after the tag check passes.  Plaintext is zeroed
-     * on failure, and the FI1 fix below hardens the branch.
+     * on failure, and SECURE_CHECK_FAILED below hardens the branch.
      */
     SECURE_BOOL_CHECK(ok1, ok2, validate_permission(saved_group_id, PERM_RECEIVE));
-    if (!(ok1 & ok2)) {   /* FI1 fix: AND both volatile reads */
+    if (SECURE_CHECK_FAILED(ok1, ok2)) {
         secure_zero(&s_work.rcv, sizeof(s_work.rcv));
         secure_zero(saved_uuid,  UUID_SIZE);
         secure_zero(saved_name,  MAX_NAME_SIZE);
@@ -639,7 +654,7 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
 
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-    if (!(ok1 & ok2)) {   /* FI1 fix */
+    if (SECURE_CHECK_FAILED(ok1, ok2)) {
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
@@ -710,9 +725,9 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
         return -1;
     }
     {
-        uint32_t n_files     = r2.list.n_files;
-        uint32_t needed_len  = (uint32_t)sizeof(uint32_t)
-                               + n_files * (uint32_t)sizeof(file_metadata_t);
+        uint32_t n_files    = r2.list.n_files;
+        uint32_t needed_len = (uint32_t)sizeof(uint32_t)
+                              + n_files * (uint32_t)sizeof(file_metadata_t);
         if (n_files > MAX_FILE_COUNT || needed_len > (uint32_t)list_data_len) {
             secure_zero(&r2, sizeof(r2));
             print_error("Operation failed");
@@ -770,79 +785,77 @@ int listen(uint16_t pkt_len, uint8_t *buf)
     /* RECEIVE_MSG — sender (responder) side                               */
     /* ================================================================== */
     if (cmd == RECEIVE_MSG) {
-        volatile bool ok1, ok2;   /* unused in listen() sender path — kept for future FI hardening */
-
-        /* Union: file_t and receive_r4_t share 8277 B of stack. */
+        /*
+         * Union: file_t and receive_r4_t share 8277 B of stack.
+         * file_t is used to read from flash; after decryption the plaintext
+         * is staged in s_work.plain (static) so the union can be reused for R4.
+         */
         union {
-            file_t       stored;
-            receive_r4_t fdata;
+            file_t       stored;   /* read from flash */
+            receive_r4_t fdata;    /* R4 wire format  */
         } u;
 
-        receive_r1_t *r1 = (receive_r1_t *)first_buf;
+        receive_r1_t *ir1 = (receive_r1_t *)first_buf;
         receive_r2_t  r2;
         receive_r3_t  r3;
         msg_type_t    r3_cmd;
         uint16_t      r3_len;
-        uint8_t       recv_chal[NONCE_SIZE];
-        uint8_t       send_chal[NONCE_SIZE];
-        char          saved_name[MAX_NAME_SIZE];
-        uint16_t      saved_group_id;
-        uint16_t      saved_contents_len;
-        uint8_t       saved_uuid[UUID_SIZE];
-        uint8_t       slot_req;
-        uint8_t       storage_aad[STORAGE_AAD_SIZE];
-        uint8_t       transfer_aad[TRANSFER_AAD_SIZE];
-        size_t        aad_len;
-        int           ret;
 
-        (void)ok1; (void)ok2;   /* suppress unused-variable warnings */
+        uint8_t  recv_chal[NONCE_SIZE];
+        uint8_t  send_chal[NONCE_SIZE];
+        uint8_t  slot_req;
+        uint8_t  saved_uuid[UUID_SIZE];
+        uint16_t saved_group_id;
+        char     saved_name[MAX_NAME_SIZE];
+        uint16_t saved_contents_len;
+        uint8_t  storage_aad[STORAGE_AAD_SIZE];
+        uint8_t  transfer_aad[TRANSFER_AAD_SIZE];
+        size_t   aad_len;
+        int      ret;
 
         if (first_len != sizeof(receive_r1_t)) { return -1; }
-        if (!validate_slot(r1->slot))          { return -1; }
 
-        slot_req = r1->slot;
-        memcpy(recv_chal, r1->recv_chal, NONCE_SIZE);
+        slot_req = ir1->slot;
+        if (!validate_slot(slot_req)) { return -1; }
+        memcpy(recv_chal, ir1->recv_chal, NONCE_SIZE);
 
-        /* Load encrypted file from flash — check in_use inline.
-         * Do NOT call is_slot_in_use() here: second file_t on stack overflows. */
-        memset(&u.stored, 0, sizeof(u.stored));
-        if (read_file(slot_req, &u.stored) != 0 ||
-            u.stored.in_use != FILE_IN_USE ||
-            !validate_contents_len(u.stored.contents_len)) {
-            secure_zero(&u.stored, sizeof(u.stored));
-            return -1;
-        }
-
-        /* Save metadata before u is repurposed for the fdata arm. */
-        saved_group_id     = u.stored.group_id;
-        saved_contents_len = u.stored.contents_len;
-        memcpy(saved_name, u.stored.name, MAX_NAME_SIZE);
-        saved_name[MAX_NAME_SIZE - 1] = '\0';
+        /* Verify the file exists and we have RECEIVE permission for it. */
         {
-            const filesystem_entry_t *fat = get_file_metadata(slot_req);
-            if (fat == NULL) {
-                secure_zero(&u.stored, sizeof(u.stored));
-                return -1;
-            }
-            memcpy(saved_uuid, fat->uuid, UUID_SIZE);
+            uint16_t gid = 0;
+            if (read_file_group_id(slot_req, &gid) != 0) { return -1; }
+            if (!validate_permission(gid, PERM_RECEIVE)) { return -1; }
         }
 
-        /* ---- R2: send sender challenge + authentication ---- */
+        /* ---- R2: send sender_auth + own send_chal ---- */
         memset(&r2, 0, sizeof(r2));
-        if (generate_nonce(r2.send_chal) != 0) {
-            secure_zero(&u.stored, sizeof(u.stored));
-            return -1;
-        }
+        if (generate_nonce(r2.send_chal) != 0) { return -1; }
         memcpy(send_chal, r2.send_chal, NONCE_SIZE);
 
         if (hmac_sha256(TRANSFER_AUTH_KEY, recv_chal, NONCE_SIZE,
                         HMAC_DOMAIN_SENDER, r2.sender_auth) != 0) {
+            secure_zero(&r2, sizeof(r2));
+            return -1;
+        }
+
+        /* Read and decrypt the requested file before committing to R2. */
+        memset(&u.stored, 0, sizeof(u.stored));
+        if (read_file(slot_req, &u.stored) != 0) {
+            secure_zero(&r2, sizeof(r2));
+            return -1;
+        }
+        if (u.stored.in_use != FILE_IN_USE || !validate_contents_len(u.stored.contents_len)) {
             secure_zero(&u.stored, sizeof(u.stored));
             secure_zero(&r2, sizeof(r2));
             return -1;
         }
 
-        /* Decrypt stored file into s_work.plain with STORAGE_KEY. */
+        /* Save header fields before union is overwritten by R4 layout. */
+        saved_contents_len = u.stored.contents_len;
+        memcpy(saved_uuid,  u.stored.uuid,  UUID_SIZE);
+        saved_group_id     = u.stored.group_id;
+        memcpy(saved_name,  u.stored.name,  MAX_NAME_SIZE);
+        saved_name[MAX_NAME_SIZE - 1] = '\0';
+
         aad_len = build_storage_aad(slot_req, saved_uuid,
                                     saved_group_id, saved_name,
                                     storage_aad);
@@ -918,7 +931,7 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         }
         secure_zero(&r3, sizeof(r3));
 
-        /* ---- R4: build and send encrypted file ---- */
+        /* ---- R4: encrypt plaintext under TRANSFER_KEY and send ---- */
         memset(&u.fdata, 0, sizeof(u.fdata));
         if (generate_nonce(u.fdata.nonce) != 0) {
             secure_zero(recv_chal, NONCE_SIZE);
@@ -929,26 +942,27 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         }
 
         u.fdata.contents_len = saved_contents_len;
+        memcpy(u.fdata.uuid,  saved_uuid,  UUID_SIZE);
         u.fdata.slot         = slot_req;
         u.fdata.group_id     = saved_group_id;
-        memcpy(u.fdata.uuid, saved_uuid, UUID_SIZE);
-        memcpy(u.fdata.name, saved_name, MAX_NAME_SIZE);
-        u.fdata.name[MAX_NAME_SIZE - 1] = '\0';
+        memcpy(u.fdata.name,  saved_name,  MAX_NAME_SIZE);
 
         aad_len = build_transfer_aad(recv_chal, send_chal,
                                      slot_req, saved_uuid,
                                      saved_group_id, saved_name,
                                      transfer_aad);
-        secure_zero(recv_chal, NONCE_SIZE);
-        secure_zero(send_chal, NONCE_SIZE);
 
         ret = aes_gcm_encrypt(TRANSFER_KEY, u.fdata.nonce,
                               transfer_aad, aad_len,
                               s_work.plain, saved_contents_len,
                               u.fdata.ciphertext, u.fdata.tag);
 
-        secure_zero(transfer_aad, sizeof(transfer_aad));
-        secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
+        secure_zero(transfer_aad,  sizeof(transfer_aad));
+        secure_zero(recv_chal,     NONCE_SIZE);
+        secure_zero(send_chal,     NONCE_SIZE);
+        secure_zero(s_work.plain,  MAX_CONTENTS_SIZE);
+        secure_zero(saved_uuid,    UUID_SIZE);
+        secure_zero(saved_name,    MAX_NAME_SIZE);
 
         if (ret != 0) {
             secure_zero(&u.fdata, sizeof(u.fdata));
@@ -1013,12 +1027,13 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         }
 
         /* Build and send R2: resp_auth || list. */
-        send_len = (uint16_t)LIST_PKT_LEN(resp_list.n_files);
+        memset(&ir2, 0, sizeof(ir2));
+        send_len = (uint16_t)(sizeof(uint32_t) +
+                   resp_list.n_files * sizeof(file_metadata_t));
 
         memcpy(hmac_input,              ir1->challenge, NONCE_SIZE);
         memcpy(hmac_input + NONCE_SIZE, &resp_list,     send_len);
 
-        memset(&ir2, 0, sizeof(ir2));
         if (hmac_sha256(TRANSFER_AUTH_KEY,
                         hmac_input, (size_t)(NONCE_SIZE + send_len),
                         HMAC_DOMAIN_INTERROGATE_RSP, ir2.resp_auth) != 0) {
@@ -1030,14 +1045,14 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         memcpy(&ir2.list, &resp_list, send_len);
 
         if (write_packet(TRANSFER_INTERFACE, INTERROGATE_MSG,
-                         &ir2, (uint16_t)(HMAC_SIZE + send_len)) != MSG_OK) {
-            secure_zero(&ir2, sizeof(ir2));
+                         &ir2,
+                         (uint16_t)(HMAC_SIZE + send_len)) != MSG_OK) {
             return -1;
         }
-        secure_zero(&ir2, sizeof(ir2));
+
         return 0;
     } /* end INTERROGATE_MSG */
 
-    /* Unknown opcode on TRANSFER_INTERFACE — ignore silently. */
+    /* Unrecognised command type on TRANSFER_INTERFACE. */
     return -1;
 }

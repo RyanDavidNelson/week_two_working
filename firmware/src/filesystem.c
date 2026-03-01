@@ -18,6 +18,12 @@
  * read_file_header() reads only 55 header bytes (through name) for the
  *   LSN-INT filter loop — avoids placing an 8277-byte file_t on the stack.
  *
+ * FAT ownership: FILE_ALLOCATION_TABLE is defined here (one translation unit,
+ *   one address).  filesystem.h declares it extern.  The old header-static
+ *   definition gave each including TU its own private copy — a multi-TU
+ *   divergence bug that would silently produce stale FAT state if any future
+ *   refactor included filesystem.h from a second .c file.
+ *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 
@@ -29,6 +35,15 @@
 #include <string.h>
 #include <stddef.h>
 #include <stdint.h>
+
+
+/**********************************************************
+ *************** FAT DEFINITION ***************************
+ *
+ * One definition lives here.  filesystem.h declares `extern` so all other
+ * translation units share this single instance via the linker.
+ **********************************************************/
+filesystem_entry_t FILE_ALLOCATION_TABLE[MAX_FILE_COUNT];
 
 
 /**********************************************************
@@ -114,7 +129,7 @@ int read_file(slot_t slot, file_t *dest)
  *   [0..3]   in_use      (4 B, uint32_t)
  *   [4]      slot        (1 B, uint8_t)
  *   [5..20]  uuid        (16 B, uint8_t[16])
- *   [21..22] group_id    (2 B, uint16_t, LE)  ← target
+ *   [21..22] group_id    (2 B, uint16_t, LE)  <- target
  *
  * Avoids placing a full 8 KB file_t on the stack for a single field read.
  */
@@ -217,6 +232,7 @@ int write_file(slot_t slot, file_t *src, const uint8_t *uuid)
 
     return flash_simple_write(faddr, (void *)src, length);
 }
+
 
 /**********************************************************
  *************** SECURE FILE OPERATIONS *******************

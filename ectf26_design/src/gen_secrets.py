@@ -1,16 +1,18 @@
 """
 gen_secrets.py - Generate deployment secrets for eCTF HSM
 
-Generates four 256-bit keys with separated responsibilities:
+Generates three 256-bit keys with separated responsibilities:
 
   STORAGE_KEY       — AES-256-GCM for files at rest (READ/WRITE).
   TRANSFER_KEY      — AES-256-GCM for files in transit (RECEIVE/LISTEN).
   TRANSFER_AUTH_KEY — HMAC-SHA256 for all protocol challenge-response
                       (sender_auth, receiver_auth, interrogate) AND for
                       computing and verifying PERMISSION_MAC.
-  PIN_KEY           — HMAC-SHA256 for computing PIN_HMAC at build time.
-                      Also stored in firmware so check_pin_cmp() can
-                      re-derive PIN_HMAC from a candidate PIN at runtime.
+
+PIN_KEY is intentionally NOT generated here.  It is a per-device secret
+generated freshly by secrets_to_c_header.py at Build HSM time so that
+extracting PIN_KEY from one device (e.g. Technician, whose PIN is known)
+reveals nothing about any other device's PIN.
 
 Author: UTD eCTF Team
 Date: 2026
@@ -46,14 +48,17 @@ def gen_secrets(groups: list[int]) -> bytes:
     storage_key       = crypto_secrets.token_bytes(32)  # AES-256-GCM at rest
     transfer_key      = crypto_secrets.token_bytes(32)  # AES-256-GCM in transit
     transfer_auth_key = crypto_secrets.token_bytes(32)  # HMAC: protocol auth + PERMISSION_MAC
-    pin_key           = crypto_secrets.token_bytes(32)  # HMAC: PIN verification (runtime)
+
+    # PIN_KEY is deliberately absent from global secrets.
+    # Each HSM gets an independent PIN_KEY from secrets_to_c_header.py
+    # so that physical compromise of the Technician's flash cannot be
+    # used to brute-force any other device's PIN offline.
 
     secrets_dict = {
         "groups":            groups,
         "storage_key":       storage_key.hex(),
         "transfer_key":      transfer_key.hex(),
         "transfer_auth_key": transfer_auth_key.hex(),
-        "pin_key":           pin_key.hex(),
     }
 
     return json.dumps(secrets_dict).encode()
@@ -85,24 +90,20 @@ def parse_args():
 
 
 def main():
-    """Main function of gen_secrets.
-
-    You will likely not have to change this function.
-    """
+    """Main function of gen_secrets."""
     args = parse_args()
 
+    if args.secrets_file.exists() and not args.force:
+        logger.error(
+            "Secrets file already exists. Use --force to overwrite."
+        )
+        return
+
     secrets = gen_secrets(args.groups)
-
-    # NOTE: Printing sensitive data is generally not good security practice.
-    logger.debug(f"Generated secrets: {secrets}")
-
-    # Open the file, erroring if it exists unless --force is provided.
-    with open(args.secrets_file, "wb" if args.force else "xb") as f:
-        f.write(secrets)
-
-    logger.success(f"Wrote secrets to {str(args.secrets_file.absolute())}")
-    logger.warning("DO NOT COMMIT THIS FILE TO VERSION CONTROL.")
+    args.secrets_file.write_bytes(secrets)
+    logger.info(f"Secrets written to {args.secrets_file}")
 
 
 if __name__ == "__main__":
     main()
+

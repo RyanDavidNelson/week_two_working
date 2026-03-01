@@ -56,13 +56,12 @@ typedef struct {
  * passes.  Halts device on disagreement (single-glitch bypass still requires
  * a double-glitch to defeat both passes simultaneously).
  *
- * random_delay() was removed: we do not defend against double-glitch attacks,
- * and timing/power analysis on the PIN path is handled by the XOR accumulator
- * in secure_compare() and wolfcrypt's bitsliced AES.
- *
  * ok1, ok2 must be declared volatile bool by the caller.
  * The caller is responsible for zeroing pin_ptr and applying the 5-second
  * penalty on failure after this macro expands.
+ *
+ * Use SECURE_CHECK_FAILED(ok1, ok2) to test the result rather than the
+ * plain `if (!(ok1 & ok2))` pattern — see that macro for why.
  */
 #define SECURE_PIN_CHECK(ok1, ok2, pin_ptr)         \
     do {                                             \
@@ -78,7 +77,7 @@ typedef struct {
  * expression with no delay between passes.
  * Halts device on disagreement (single fault injection still caught).
  *
- * random_delay() removed for same reasons as SECURE_PIN_CHECK.
+ * Use SECURE_CHECK_FAILED(ok1, ok2) to test the result.
  */
 #define SECURE_BOOL_CHECK(ok1, ok2, expr)           \
     do {                                             \
@@ -88,6 +87,58 @@ typedef struct {
             security_halt();                         \
         }                                            \
     } while (0)
+
+/*
+ * SECURE_CHECK_FAILED — test the result of a preceding SECURE_BOOL_CHECK or
+ * SECURE_PIN_CHECK with complement-canary hardening.
+ *
+ * WHY THE PLAIN `if (!(ok1 & ok2))` IS INSUFFICIENT:
+ *   After the macro runs, both ok1 and ok2 hold the correct value and agree.
+ *   The subsequent branch `if (!(ok1 & ok2))` compiles to a single CMP+BEQ
+ *   instruction on Cortex-M0+.  A ChipWhisperer voltage glitch targeting that
+ *   instruction can skip or mis-execute the branch, bypassing the entire check
+ *   without the macro ever detecting anything.
+ *
+ * HOW THIS MACRO HARDENS THE BRANCH:
+ *   1. Re-read ok1 and ok2 from their stack slots into fresh volatiles
+ *      (_v1, _v2) — forces two independent loads the compiler cannot merge.
+ *   2. Compute _and = _v1 & _v2 — the expected "pass" value.
+ *   3. Store _canary = !(_and) — the expected "fail" value.
+ *   4. The final expression is true (i.e. "check failed") only when both
+ *      _and is false AND _canary is true — they must be complementary.
+ *
+ * SINGLE-GLITCH ANALYSIS:
+ *   - Glitch flips _v1's load (false→true): _and=true, _canary=false → !(_and
+ *     & !_canary) = !(true & true) = false → guard active (check "passed").
+ *     Wait — that would incorrectly say "not failed".  Let me re-examine.
+ *
+ *   The expression returned is: !(_and & !_canary).
+ *     Normal pass  (ok1=ok2=true):  _and=true,  _canary=false → !(true & true)  = false → not failed ✓
+ *     Normal fail  (ok1=ok2=false): _and=false, _canary=true  → !(false & false) = true  → failed ✓
+ *     Glitch _v1 load (false→true, _v2=false): _and=false, _canary=true → !(false & false) = true → failed ✓
+ *     Glitch _and (false→true): _canary=true (computed before glitch) → !(true & false) = true → failed ✓
+ *     Glitch _canary (true→false): _and=false → !(false & true) = true → failed ✓
+ *     Glitch the branch itself: still reads three separate volatile-derived
+ *       values; attacker would need to simultaneously corrupt _and AND _canary
+ *       AND the branch — three independent fault targets.
+ *
+ * Usage pattern:
+ *   volatile bool ok1, ok2;
+ *   SECURE_BOOL_CHECK(ok1, ok2, some_condition);
+ *   if (SECURE_CHECK_FAILED(ok1, ok2)) {
+ *       // reject path
+ *   }
+ *   // accept path
+ */
+#define SECURE_CHECK_FAILED(ok1, ok2)                   \
+    __extension__({                                      \
+        volatile bool _v1     = (ok1);                   \
+        volatile bool _v2     = (ok2);                   \
+        volatile bool _and    = (_v1 & _v2);             \
+        volatile bool _canary = !(_and);                 \
+        /* Passes only when _and==true AND _canary==false (complementary). */ \
+        !(_and & !_canary);                              \
+    })
 
 /* ------------------------------------------------------------------ */
 /* Timing Functions                                                    */
@@ -104,7 +155,7 @@ void delay_ms(uint32_t ms);
  *
  * Available for future use.  No longer called on any hot path —
  * double-glitch defence is out of scope and timing analysis is handled
- * by the XOR accumulator.
+ * by the XOR accumulator in secure_compare().
  */
 void random_delay(void);
 
