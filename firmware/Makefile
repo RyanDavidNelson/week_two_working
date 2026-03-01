@@ -5,9 +5,14 @@ include $(MSPM0_SDK_INSTALL_DIR)/tools/imports_mak/imports.mak.linux
 CC      = "$(TICLANG_ARMCOMPILER)/bin/tiarmclang"
 LNK     = "$(TICLANG_ARMCOMPILER)/bin/tiarmclang"
 OBJCOPY = "$(TICLANG_ARMCOMPILER)/bin/tiarmobjcopy"
-BUILDDIR   ?= /tmp/build
-VPATH      = "src"
-LINKERFILE = "firmware.ld"
+BUILDDIR     ?= /tmp/build
+VPATH        = "src"
+
+# LINKERFILE_PATH is overridden by build.sh to point at the shuffled linker
+# script after shuffle_sections.py runs.  Default falls back to the base
+# firmware.ld so 'make' alone still works for quick debugging.
+LINKERFILE      ?= firmware.ld
+LINKERFILE_PATH ?= ./$(LINKERFILE)
 
 # =============================================================================
 # Main firmware objects
@@ -88,13 +93,22 @@ CFLAGS += -I.. \
     "-I$(MSPM0_SDK_INSTALL_DIR)/source/third_party/CMSIS/Core/Include" \
     "-I$(MSPM0_SDK_INSTALL_DIR)/source" \
     "-I./inc" \
-    -gdwarf-3 \
     -mcpu=cortex-m0plus \
     -march=thumbv6m \
     -mfloat-abi=soft \
     -mthumb \
-    -fstack-protector-strong
+    -fstack-protector-strong \
+    -ffunction-sections
 
+# Removed:  -gdwarf-3   (DWARF hands Ghidra/IDA every struct layout and
+#                         variable name; stripped at link time anyway but
+#                         not including it at all is cleaner and faster).
+#
+# Added:    -ffunction-sections   (each function lands in its own .text.<sym>
+#                                  ELF section; shuffle_sections.py reorders
+#                                  them before linking so every build has a
+#                                  different function layout in flash).
+#
 # -fstack-protector-strong: instrument every function that has a local array,
 # an address-taken local, or a local struct/union — the realistic smash surface.
 # The compiler inserts a load of __stack_chk_guard at entry and a matching
@@ -111,7 +125,7 @@ LFLAGS += "-l$(MSPM0_SDK_INSTALL_DIR)/source/ti/drivers/lib/ticlang/m0p/drivers_
     "-l$(MSPM0_SDK_INSTALL_DIR)/source/ti/driverlib/lib/ticlang/m0p/mspm0l122x_l222x/driverlib.a" \
     "-L$(MSPM0_SDK_INSTALL_DIR)/source" \
     -L.. \
-    ./$(LINKERFILE) \
+    $(LINKERFILE_PATH) \
     "-Wl,-m,$(BUILDDIR)/$(NAME).map" \
     -Wl,--rom_model \
     -Wl,--warn_sections \
@@ -123,10 +137,17 @@ LFLAGS += "-l$(MSPM0_SDK_INSTALL_DIR)/source/ti/drivers/lib/ticlang/m0p/drivers_
 # =============================================================================
 all: $(BUILDDIR)/$(NAME).elf $(BUILDDIR)/$(NAME).bin
 
+# compile_only: build all .so objects without invoking the linker.
+# Called by build.sh before shuffle_sections.py so the script can inspect
+# the compiled objects for .text.* section names.
+compile_only: $(OBJECTS)
+	@ echo "compile_only: all objects built."
+
 $(BUILDDIR):
 	@ mkdir -p $(BUILDDIR)
 
 # Firmware source files (src/*.c) → BUILDDIR
+# -ffunction-sections is inherited from CFLAGS above.
 $(BUILDDIR)/%.so: ./src/%.c | $(BUILDDIR)
 	@ echo Building $@
 	@ $(CC) $(CFLAGS) -c $< -o $@
@@ -134,9 +155,11 @@ $(BUILDDIR)/%.so: ./src/%.c | $(BUILDDIR)
 # wolfSSL source files → BUILDDIR
 # Compiled without -fstack-protector-strong: wolfcrypt is not attack-facing
 # and the flag would pull in libssp symbols not available on this bare-metal target.
+# wolfSSL does NOT receive -ffunction-sections — not attack-facing and adds
+# no value to the shuffle since wolfSSL symbols carry no design secrets.
 $(BUILDDIR)/%.so: $(WOLFSSL_SRC)/%.c | $(BUILDDIR)
 	@ echo Building WolfSSL: $@
-	@ $(CC) $(CFLAGS) -fno-stack-protector -O2 -c $< -o $@
+	@ $(CC) $(CFLAGS) -fno-stack-protector -fno-function-sections -O2 -c $< -o $@
 
 $(BUILDDIR)/$(NAME).elf: $(OBJECTS)
 	@ echo Linking $@
@@ -148,4 +171,4 @@ $(BUILDDIR)/$(NAME).bin: $(BUILDDIR)/$(NAME).elf
 clean:
 	@ rm -rf $(BUILDDIR)
 
-.PHONY: all clean
+.PHONY: all compile_only clean`
