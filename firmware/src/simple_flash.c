@@ -44,6 +44,29 @@ int flash_simple_erase_page(uint32_t address) {
 }
 
 /**
+ * @brief Flash Simple Erase Pages
+ *
+ * @param address:   uint32_t, address of first flash page to erase
+ * @param num_pages: uint8_t,  number of contiguous pages to erase
+ *
+ * @return int: return negative if any page erase fails, zero if all succeed
+ *
+ * Erases num_pages contiguous flash pages starting at address.
+ * Symmetric counterpart to flash_simple_write() for multi-page operations.
+ * Loop counter page_i in [0, num_pages); terminates when page_i == num_pages.
+*/
+int flash_simple_erase_pages(uint32_t address, uint8_t num_pages) {
+    uint8_t page_i; /* loop counter — terminates at num_pages */
+
+    for (page_i = 0; page_i < num_pages; page_i++) {
+        if (flash_simple_erase_page(address + (FLASH_PAGE_SIZE * (uint32_t)page_i)) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/**
  * @brief Flash Simple Read
  *
  * @param address: uint32_t, address of flash page to read

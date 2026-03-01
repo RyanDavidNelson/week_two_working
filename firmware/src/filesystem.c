@@ -193,7 +193,6 @@ int write_file(slot_t slot, file_t *src, const uint8_t *uuid)
 {
     uint32_t     faddr;
     unsigned int length;
-    uint8_t      page_i;   /* loop counter — terminates at FILE_PAGE_COUNT */
 
     if (!validate_slot(slot) || src == NULL || uuid == NULL) {
         return -1;
@@ -211,15 +210,13 @@ int write_file(slot_t slot, file_t *src, const uint8_t *uuid)
     FILE_ALLOCATION_TABLE[slot].length     = (uint16_t)length;
     store_fat();
 
-    /* Erase all pages for this slot before writing.
-     * page_i < FILE_PAGE_COUNT ensures we never exceed the allocation. */
-    for (page_i = 0; page_i < FILE_PAGE_COUNT; page_i++) {
-        flash_simple_erase_page(faddr + (FLASH_PAGE_SIZE * (uint32_t)page_i));
+    /* Erase all pages for this slot, then write the file. */
+    if (flash_simple_erase_pages(faddr, FILE_PAGE_COUNT) != 0) {
+        return -1;
     }
 
     return flash_simple_write(faddr, (void *)src, length);
 }
-
 
 /**********************************************************
  *************** SECURE FILE OPERATIONS *******************
