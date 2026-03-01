@@ -28,6 +28,11 @@
  *
  * SCA: random_delay() before key load; peripheral reset clears key registers.
  *
+ * FIX #2: aes_gcm_decrypt() now double-evaluates secure_compare() and calls
+ *   security_halt() on disagreement, matching hmac_verify()'s fault hardening.
+ *   A single glitch that skips or mispredicts the tag comparison branch is
+ *   caught before any plaintext is returned.
+ *
  * Include order: wolfssl headers first so settings.h resolves CFLAGS defines
  * before hmac.h applies its conditional guards.
  *
@@ -39,6 +44,7 @@
 
 #include "ti/driverlib/dl_aesadv.h"
 #include "crypto.h"
+#include "filesystem.h"
 #include "security.h"
 #include "secrets.h"
 #include <string.h>
@@ -341,7 +347,7 @@ int generate_nonce(uint8_t *nonce_out)
  * aes_gcm_encrypt — AES-256-GCM encryption via AESADV hardware.
  *
  * SCA: random_delay() before key load slides the key-schedule power
- * signature across a ~20 ms trace window.
+ * signature across a ~4 ms trace window.
  * ---------------------------------------------------------------------- */
 int aes_gcm_encrypt(const uint8_t *key,
                     const uint8_t *nonce,
@@ -371,7 +377,10 @@ int aes_gcm_encrypt(const uint8_t *key,
  * aes_gcm_decrypt — AES-256-GCM decryption via AESADV hardware.
  *
  * The hardware computes a tag over the ciphertext; we compare it with the
- * expected tag using secure_compare() (constant-time, no early exit).
+ * expected tag using a double-evaluated secure_compare() (constant-time,
+ * no early exit) that mirrors hmac_verify()'s fault hardening:
+ *   — Both evaluations must agree; security_halt() fires on disagreement.
+ *   — A single glitch skipping the branch or flipping one result is caught.
  * Plaintext is zeroed on any failure — no partial plaintext leaks.
  * ---------------------------------------------------------------------- */
 int aes_gcm_decrypt(const uint8_t *key,
@@ -382,6 +391,8 @@ int aes_gcm_decrypt(const uint8_t *key,
                     uint8_t       *plaintext)
 {
     uint8_t computed_tag[TAG_SIZE];
+    bool    tag_ok1;
+    bool    tag_ok2;
     int     ret;
 
     if (key == NULL || nonce == NULL || tag == NULL || plaintext == NULL) {
@@ -404,8 +415,28 @@ int aes_gcm_decrypt(const uint8_t *key,
         return -1;
     }
 
-    /* Constant-time tag comparison — must not short-circuit. */
-    if (!secure_compare(computed_tag, tag, TAG_SIZE)) {
+    /*
+     * FIX #2: Double-evaluation tag comparison — mirrors hmac_verify().
+     *
+     * secure_compare() is constant-time (XOR accumulator, no early exit).
+     * Evaluating it twice with no delay between passes means a single fault
+     * injection that flips one result but not the other is caught by the
+     * agreement check.  security_halt() fires on disagreement.
+     *
+     * Both evaluations operate over the same computed_tag vs tag buffers;
+     * neither side has been modified between calls.
+     */
+    tag_ok1 = secure_compare(computed_tag, tag, TAG_SIZE);
+    tag_ok2 = secure_compare(computed_tag, tag, TAG_SIZE);
+
+    if ((bool)tag_ok1 != (bool)tag_ok2) {
+        /* Disagreement — likely a fault injection attempt. */
+        secure_zero(plaintext,    ct_len);
+        secure_zero(computed_tag, sizeof(computed_tag));
+        security_halt();
+    }
+
+    if (!tag_ok1) {
         secure_zero(plaintext,    ct_len);
         secure_zero(computed_tag, sizeof(computed_tag));
         return -1;
@@ -460,11 +491,11 @@ hmac_fail:
 
 
 /* -----------------------------------------------------------------------
- * hmac_verify — constant-time, glitch-resistant HMAC comparison.
+ * hmac_verify — constant-time HMAC-SHA256 verification, glitch-hardened.
  *
- * Computes the MAC twice with random_delay() between passes.
- * security_halt() if the two results differ (fault injection attempt).
- * Final comparison uses secure_compare() — no early exit.
+ * Computes the MAC twice with a random_delay() between passes.
+ * Calls security_halt() if both passes disagree (fault injection).
+ * Uses secure_compare() for the final comparison — no early exit.
  * ---------------------------------------------------------------------- */
 bool hmac_verify(const uint8_t *key,
                  const uint8_t *data, size_t data_len,
@@ -473,70 +504,74 @@ bool hmac_verify(const uint8_t *key,
 {
     uint8_t mac1[HMAC_SIZE];
     uint8_t mac2[HMAC_SIZE];
-    bool    result;
+    bool    match1;
+    bool    match2;
 
     if (key == NULL || expected == NULL || domain == NULL) { return false; }
 
+    /* First pass. */
     if (hmac_sha256(key, data, data_len, domain, mac1) != 0) {
         secure_zero(mac1, sizeof(mac1));
         return false;
     }
 
-    random_delay();
+    random_delay();   /* desynchronise the two passes */
 
+    /* Second pass — independent recomputation. */
     if (hmac_sha256(key, data, data_len, domain, mac2) != 0) {
         secure_zero(mac1, sizeof(mac1));
         secure_zero(mac2, sizeof(mac2));
         return false;
     }
 
-    /* Both passes must agree — disagreement signals fault injection. */
+    /* Both passes must produce the same MAC; disagreement → fault. */
     if (!secure_compare(mac1, mac2, HMAC_SIZE)) {
+        secure_zero(mac1, sizeof(mac1));
+        secure_zero(mac2, sizeof(mac2));
         security_halt();
     }
 
-    result = secure_compare(mac1, expected, HMAC_SIZE);
+    match1 = secure_compare(mac1, expected, HMAC_SIZE);
+    match2 = secure_compare(mac2, expected, HMAC_SIZE);
 
     secure_zero(mac1, sizeof(mac1));
     secure_zero(mac2, sizeof(mac2));
-    return result;
-}
 
-
-/* -----------------------------------------------------------------------
- * build_storage_aad — slot(1) || uuid(16) || group_id(2 LE) || name(32)
- * Returns STORAGE_AAD_SIZE (51).
- * Name is zero-padded to 32 bytes; bounded loop avoids strlen on flash data.
- * ---------------------------------------------------------------------- */
-size_t build_storage_aad(uint8_t slot, const uint8_t *uuid,
-                         uint16_t group_id, const char *name,
-                         uint8_t *out)
-{
-    uint8_t i;
-    uint8_t pos = 0U;
-
-    out[pos++] = slot;
-
-    /* uuid — loop counter i in [0, 16) */
-    for (i = 0U; i < 16U; i++) { out[pos++] = uuid[i]; }
-
-    /* group_id little-endian */
-    out[pos++] = (uint8_t)(group_id & 0xFFU);
-    out[pos++] = (uint8_t)((group_id >> 8) & 0xFFU);
-
-    /* name zero-padded — loop counter i in [0, 32) */
-    for (i = 0U; i < 32U; i++) {
-        out[pos++] = (name != NULL && name[i] != '\0') ? (uint8_t)name[i] : 0U;
+    /* Both comparisons must agree; disagreement → fault. */
+    if ((bool)match1 != (bool)match2) {
+        security_halt();
     }
 
-    return STORAGE_AAD_SIZE;   /* 51 */
+    return match1;
 }
 
 
 /* -----------------------------------------------------------------------
- * build_transfer_aad — recv_chal(12) || send_chal(12) || slot(1)
- *                      || uuid(16) || group_id(2 LE) || name(32)
- * Returns TRANSFER_AAD_SIZE (75).
+ * build_storage_aad — construct 51-byte AAD for at-rest encryption.
+ * Format: slot(1) || uuid(16) || group_id(2 LE) || name(32) = 51 B.
+ * ---------------------------------------------------------------------- */
+size_t build_storage_aad(uint8_t        slot,
+                         const uint8_t *uuid,
+                         uint16_t       group_id,
+                         const char    *name,
+                         uint8_t       *out)
+{
+    size_t off = 0;
+
+    out[off++] = slot;
+    memcpy(out + off, uuid, UUID_SIZE);         off += UUID_SIZE;
+    out[off++] = (uint8_t)(group_id & 0xFF);
+    out[off++] = (uint8_t)((group_id >> 8) & 0xFF);
+    memcpy(out + off, name, MAX_NAME_SIZE);     off += MAX_NAME_SIZE;
+
+    return off; /* STORAGE_AAD_SIZE = 51 */
+}
+
+
+/* -----------------------------------------------------------------------
+ * build_transfer_aad — construct 75-byte AAD for in-transit encryption.
+ * Format: recv_chal(12) || send_chal(12) || slot(1) || uuid(16)
+ *         || group_id(2 LE) || name(32) = 75 B.
  * ---------------------------------------------------------------------- */
 size_t build_transfer_aad(const uint8_t *recv_chal,
                           const uint8_t *send_chal,
@@ -546,28 +581,15 @@ size_t build_transfer_aad(const uint8_t *recv_chal,
                           const char    *name,
                           uint8_t       *out)
 {
-    uint8_t i;
-    uint8_t pos = 0U;
+    size_t off = 0;
 
-    /* recv_chal — loop counter i in [0, NONCE_SIZE) */
-    for (i = 0U; i < NONCE_SIZE; i++) { out[pos++] = recv_chal[i]; }
+    memcpy(out + off, recv_chal, NONCE_SIZE);   off += NONCE_SIZE;
+    memcpy(out + off, send_chal, NONCE_SIZE);   off += NONCE_SIZE;
+    out[off++] = slot;
+    memcpy(out + off, uuid, UUID_SIZE);         off += UUID_SIZE;
+    out[off++] = (uint8_t)(group_id & 0xFF);
+    out[off++] = (uint8_t)((group_id >> 8) & 0xFF);
+    memcpy(out + off, name, MAX_NAME_SIZE);     off += MAX_NAME_SIZE;
 
-    /* send_chal — loop counter i in [0, NONCE_SIZE) */
-    for (i = 0U; i < NONCE_SIZE; i++) { out[pos++] = send_chal[i]; }
-
-    out[pos++] = slot;
-
-    /* uuid — loop counter i in [0, 16) */
-    for (i = 0U; i < 16U; i++) { out[pos++] = uuid[i]; }
-
-    /* group_id little-endian */
-    out[pos++] = (uint8_t)(group_id & 0xFFU);
-    out[pos++] = (uint8_t)((group_id >> 8) & 0xFFU);
-
-    /* name zero-padded — loop counter i in [0, 32) */
-    for (i = 0U; i < 32U; i++) {
-        out[pos++] = (name != NULL && name[i] != '\0') ? (uint8_t)name[i] : 0U;
-    }
-
-    return TRANSFER_AAD_SIZE;  /* 75 */
+    return off; /* TRANSFER_AAD_SIZE = 75 */
 }

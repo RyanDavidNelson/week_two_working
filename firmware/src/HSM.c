@@ -17,6 +17,10 @@
 #include "simple_uart.h"
 #include "security.h"
 
+/*
+ * Single receive buffer for all host commands.
+ * Sized to the largest possible host→HSM packet (write_command_t = 8251 B).
+ */
 static unsigned char uart_buf[MAX_MSG_SIZE];
 
 /**
@@ -46,8 +50,8 @@ void init(void)
 int main(void)
 {
     msg_type_t cmd;
-    int result;
-    uint16_t pkt_len;
+    int        result;
+    uint16_t   pkt_len;
 
     init();
 
@@ -55,8 +59,18 @@ int main(void)
     while (1) {
         STATUS_LED_ON();
 
-        pkt_len = 0;
-        result = read_packet(CONTROL_INTERFACE, &cmd, uart_buf, &pkt_len);
+        /*
+         * FIX #1: initialise pkt_len to MAX_MSG_SIZE, not 0.
+         *
+         * read_packet() only enforces the overflow guard when *len != 0:
+         *   if (*len != 0 && header.len > *len) { return MSG_BAD_LEN; }
+         * Passing 0 disabled the check, allowing an attacker to send a
+         * packet with header.len up to UINT16_MAX (65535) and write past
+         * the end of uart_buf[8251] into adjacent .bss (s_work, FAT).
+         * Passing MAX_MSG_SIZE caps any inbound packet at the buffer size.
+         */
+        pkt_len = MAX_MSG_SIZE;
+        result  = read_packet(CONTROL_INTERFACE, &cmd, uart_buf, &pkt_len);
 
         if (result != MSG_OK) {
             STATUS_LED_OFF();
@@ -65,7 +79,7 @@ int main(void)
 
         STATUS_LED_OFF();
 
-        /* Handle the requested command */
+        /* Dispatch the requested command */
         switch (cmd) {
         case LIST_MSG:
             list(pkt_len, uart_buf);

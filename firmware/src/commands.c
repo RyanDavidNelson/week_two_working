@@ -1,9 +1,7 @@
 /**
  * @file commands.c
- * @brief eCTF command handlers — DEBUG BUILD
+ * @brief eCTF command handlers
  * @date 2026
- *
- * *** DEBUG VERSION — remove all print_debug() calls before competition. ***
  *
  * Module 5: Full mutual-authentication transfer protocol.
  *
@@ -21,7 +19,7 @@
  *     list  → generate_list_files        8277 B  file_t temp_file
  *     write → secure_write_file          8300 B
  *     read  → secure_read_file           8300 B  (s_work.rsp used, not stack)
- *     receive → secure_write_file         8400 B  (s_work.rcv used, not stack)
+ *     receive → secure_write_file        8400 B  (s_work.rcv used, not stack)
  *     listen / RECEIVE_MSG               8700 B  union u (file_t / r4 shared)
  *     listen / INTERROGATE_MSG           1000 B  file_header_t hdr + resp_list + hmac_input
  *
@@ -31,7 +29,7 @@
  *   RECEIVE FIX: receive_r4_t was formerly 8273 B on the stack of receive().
  *   When receive() called secure_write_file() (which allocates file_t = 8277 B),
  *   the combined stack reached ~17.25 KB, overflowing the ~15.8 KB budget and
- *   causing a hard fault after "RCV: writing to flash".
+ *   causing a hard fault after writing to flash.
  *   Fix: receive R4 into s_work.rcv (static), save the 81-byte header to
  *   small stack variables, decrypt in-place (wolfcrypt AES-GCM supports
  *   in == out for CTR-based operation), then call secure_write_file with
@@ -43,6 +41,15 @@
  *   TRANSFER_KEY      — in-transit AES-GCM (receive R4, listen R4 tx)
  *   TRANSFER_AUTH_KEY — all HMAC challenge-response and permission MAC
  *   PIN_KEY           — PIN verification via SECURE_PIN_CHECK
+ *
+ * FIX #3: write() now validates name AFTER the PIN check, not before.
+ *   Previously an attacker could probe name field validity (printable ASCII,
+ *   null-terminated within 32 bytes) without supplying a PIN.  All other
+ *   structural checks (slot, contents_len, packet length) are kept before
+ *   the PIN because they guard against malformed packets that cannot
+ *   succeed regardless of credentials.
+ *
+ * FIX #5: All print_debug() calls removed from production build.
  *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
@@ -137,37 +144,58 @@ static bool validate_perm_bytes(const uint8_t *perm_bytes, uint8_t perm_count)
  * Verify a peer's PERMISSION_MAC.
  * MAC = HMAC(TRANSFER_AUTH_KEY, perm_count_byte || perm_bytes || "permission").
  */
-static bool verify_perm_mac(uint8_t perm_count, const uint8_t *perm_bytes,
-                             const uint8_t *received_mac)
+static bool verify_perm_mac(uint8_t perm_count,
+                             const uint8_t *perm_bytes,
+                             const uint8_t *mac)
 {
-    uint8_t buf[1 + MAX_PERMS * PERM_SERIAL_SIZE];
-    buf[0] = perm_count;
-    memcpy(buf + 1, perm_bytes, (size_t)perm_count * PERM_SERIAL_SIZE);
-    return hmac_verify(TRANSFER_AUTH_KEY,
-                       buf, 1 + (size_t)perm_count * PERM_SERIAL_SIZE,
-                       HMAC_DOMAIN_PERMISSION, received_mac);
+    uint8_t hmac_input[1 + MAX_PERMS * PERM_SERIAL_SIZE];
+    uint8_t computed[HMAC_SIZE];
+    bool    result;
+
+    hmac_input[0] = perm_count;
+    memcpy(hmac_input + 1, perm_bytes, (size_t)perm_count * PERM_SERIAL_SIZE);
+
+    if (hmac_sha256(TRANSFER_AUTH_KEY,
+                    hmac_input,
+                    1u + (size_t)perm_count * PERM_SERIAL_SIZE,
+                    HMAC_DOMAIN_PERMISSION,
+                    computed) != 0) {
+        secure_zero(computed, sizeof(computed));
+        return false;
+    }
+
+    result = secure_compare(computed, mac, HMAC_SIZE);
+    secure_zero(computed, sizeof(computed));
+    secure_zero(hmac_input, sizeof(hmac_input));
+    return result;
 }
 
 /*
- * Check if any serialized permission entry grants RECEIVE for target_group_id.
+ * Check whether the serialized permissions contain RECEIVE for group_id.
  * Loop counter i in [0, perm_count); terminates when i == perm_count.
  */
-static bool perm_bytes_has_receive(const uint8_t *perm_bytes, uint8_t perm_count,
-                                   uint16_t target_group_id)
+static bool perm_bytes_has_receive(const uint8_t *perm_bytes,
+                                   uint8_t        perm_count,
+                                   uint16_t       group_id)
 {
     uint8_t i;
     for (i = 0; i < perm_count; i++) {
         const uint8_t *p = perm_bytes + (size_t)i * PERM_SERIAL_SIZE;
         uint16_t gid = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-        if (gid == target_group_id && p[4] == 1u) {
+        if (gid == group_id && p[4] == 1u) {
             return true;
         }
     }
     return false;
 }
 
+
+/**********************************************************
+ ******************** LIST HELPERS ************************
+ **********************************************************/
+
 /*
- * Build a list of all occupied file slots.
+ * Build file list for the LIST response.
  *
  * Loop counter slot in [0, MAX_FILE_COUNT); terminates when slot == MAX_FILE_COUNT.
  *
@@ -314,13 +342,21 @@ int read(uint16_t pkt_len, uint8_t *buf)
  */
 #define WRITE_CMD_HEADER_SIZE ((uint16_t)offsetof(write_command_t, contents))
 
-/* WRITE — permission enforced; overwrites existing slot content if occupied. */
+/*
+ * WRITE — permission enforced; overwrites existing slot content if occupied.
+ *
+ * FIX #3: validate_name() is now called AFTER the PIN check.
+ *   Structural guards (slot, contents_len, packet length) that reject
+ *   malformed packets regardless of credentials remain before the PIN.
+ *   Moving validate_name() after the PIN eliminates the pre-auth oracle
+ *   that allowed an attacker to probe name field validity without a PIN.
+ */
 int write(uint16_t pkt_len, uint8_t *buf)
 {
     write_command_t *command = (write_command_t *)buf;
     volatile bool    ok1, ok2;
 
-    /* Step 1: enough bytes to read the fixed header (including contents_len). */
+    /* Step 1: structural guards — reject malformed packets before any work. */
     if (pkt_len < WRITE_CMD_HEADER_SIZE) {
         print_error("Operation failed");
         return -1;
@@ -333,20 +369,22 @@ int write(uint16_t pkt_len, uint8_t *buf)
         print_error("Operation failed");
         return -1;
     }
-    /* Step 2: enough bytes for the declared payload. */
     if (pkt_len < (uint16_t)(WRITE_CMD_HEADER_SIZE + command->contents_len)) {
         print_error("Operation failed");
         return -1;
     }
-    if (!validate_name(command->name, MAX_NAME_SIZE)) {
-        print_error("Operation failed");
-        return -1;
-    }
 
+    /* Step 2: authenticate before inspecting any business-logic fields. */
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
     if (!ok1) {
         delay_ms(4500);
+        print_error("Operation failed");
+        return -1;
+    }
+
+    /* Step 3: validate name only after a valid PIN — prevents pre-auth oracle. */
+    if (!validate_name(command->name, MAX_NAME_SIZE)) {
         print_error("Operation failed");
         return -1;
     }
@@ -382,7 +420,7 @@ int write(uint16_t pkt_len, uint8_t *buf)
  * STACK FIX: receive_r4_t (8273 B) now lives in s_work.rcv (static).
  * Formerly it was a local variable; when receive() called secure_write_file()
  * (which pushes file_t = 8277 B), the combined stack hit ~17.25 KB and
- * overflowed, causing a hard fault after "RCV: writing to flash".
+ * overflowed, causing a hard fault after writing to flash.
  *
  * Approach: receive R4 into s_work.rcv, save the 81-byte header to small
  * stack variables, decrypt in-place (wolfcrypt AES-GCM CTR supports in==out),
@@ -411,14 +449,11 @@ int receive(uint16_t pkt_len, uint8_t *buf)
     uint16_t saved_group_id;               /*  2 B */
     char     saved_name[MAX_NAME_SIZE];     /* 32 B */
 
-    print_debug("RCV: enter");
-
     if (pkt_len < sizeof(receive_command_t)) {
         print_error("Operation failed");
         return -1;
     }
     if (!validate_slot(command->read_slot) || !validate_slot(command->write_slot)) {
-        print_debug("RCV: bad slot");
         print_error("Operation failed");
         return -1;
     }
@@ -426,12 +461,10 @@ int receive(uint16_t pkt_len, uint8_t *buf)
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
     if (!ok1) {
-        print_debug("RCV: bad pin");
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
     }
-    print_debug("RCV: pin ok");
 
     /* ---- R1: send slot + receiver challenge ---- */
     memset(&r1, 0, sizeof(r1));
@@ -440,15 +473,12 @@ int receive(uint16_t pkt_len, uint8_t *buf)
         print_error("Operation failed");
         return -1;
     }
-    print_debug("RCV: sending R1 on UART1");
     delay_ms(200);
     if (write_packet(TRANSFER_INTERFACE, RECEIVE_MSG, &r1, sizeof(r1)) != MSG_OK) {
-        print_debug("RCV: R1 write fail (no peer ACK)");
         secure_zero(&r1, sizeof(r1));
         print_error("Operation failed");
         return -1;
     }
-    print_debug("RCV: R1 sent, waiting R2");
 
     /* ---- R2: verify sender authentication ---- */
     memset(&r2, 0, sizeof(r2));
@@ -456,22 +486,18 @@ int receive(uint16_t pkt_len, uint8_t *buf)
     cmd    = 0;
     if (read_packet(TRANSFER_INTERFACE, &cmd, &r2, &r2_len) != MSG_OK ||
         cmd != RECEIVE_MSG || r2_len != sizeof(r2)) {
-        print_debug("RCV: R2 timeout/wrong opcode/wrong len");
         secure_zero(&r1, sizeof(r1));
         secure_zero(&r2, sizeof(r2));
         print_error("Operation failed");
         return -1;
     }
-    print_debug("RCV: R2 ok, checking sender HMAC");
     if (!hmac_verify(TRANSFER_AUTH_KEY, r1.recv_chal, NONCE_SIZE,
                      HMAC_DOMAIN_SENDER, r2.sender_auth)) {
-        print_debug("RCV: R2 HMAC fail");
         secure_zero(&r1, sizeof(r1));
         secure_zero(&r2, sizeof(r2));
         print_error("Operation failed");
         return -1;
     }
-    print_debug("RCV: R2 HMAC ok");
 
     /* ---- R3: send receiver auth + own permission proof ---- */
     memset(&r3, 0, sizeof(r3));
@@ -485,9 +511,7 @@ int receive(uint16_t pkt_len, uint8_t *buf)
     r3.perm_count = PERM_COUNT;
     serialize_permissions(global_permissions, PERM_COUNT, r3.perms);
     memcpy(r3.perm_mac, PERMISSION_MAC, HMAC_SIZE);
-    print_debug("RCV: sending R3 on UART1");
     if (write_packet(TRANSFER_INTERFACE, RECEIVE_MSG, &r3, sizeof(r3)) != MSG_OK) {
-        print_debug("RCV: R3 write fail (no peer ACK)");
         secure_zero(&r1, sizeof(r1));
         secure_zero(&r2, sizeof(r2));
         secure_zero(&r3, sizeof(r3));
@@ -495,7 +519,6 @@ int receive(uint16_t pkt_len, uint8_t *buf)
         return -1;
     }
     secure_zero(&r3, sizeof(r3));
-    print_debug("RCV: R3 sent, waiting R4");
 
     /* ---- R4: receive encrypted file into s_work.rcv (static, not stack) ---- */
     memset(&s_work.rcv, 0, sizeof(s_work.rcv));
@@ -503,16 +526,13 @@ int receive(uint16_t pkt_len, uint8_t *buf)
     cmd    = 0;
     if (read_packet(TRANSFER_INTERFACE, &cmd, &s_work.rcv, &r4_len) != MSG_OK ||
         cmd != RECEIVE_MSG) {
-        print_debug("RCV: R4 timeout/wrong opcode");
         secure_zero(&r1, sizeof(r1));
         secure_zero(&r2, sizeof(r2));
         secure_zero(&s_work.rcv, sizeof(s_work.rcv));
         print_error("Operation failed");
         return -1;
     }
-    print_debug("RCV: R4 received");
     if (!validate_contents_len(s_work.rcv.contents_len)) {
-        print_debug("RCV: R4 bad contents_len");
         secure_zero(&r1, sizeof(r1));
         secure_zero(&r2, sizeof(r2));
         secure_zero(&s_work.rcv, sizeof(s_work.rcv));
@@ -520,14 +540,12 @@ int receive(uint16_t pkt_len, uint8_t *buf)
         return -1;
     }
     if (r4_len != (uint16_t)(FILE_DATA_HEADER_SIZE + s_work.rcv.contents_len)) {
-        print_debug("RCV: R4 length mismatch");
         secure_zero(&r1, sizeof(r1));
         secure_zero(&r2, sizeof(r2));
         secure_zero(&s_work.rcv, sizeof(s_work.rcv));
         print_error("Operation failed");
         return -1;
     }
-    print_debug("RCV: R4 validated, decrypting");
 
     /*
      * Save the 81-byte R4 header to stack variables so that s_work.rcv can be
@@ -568,19 +586,16 @@ int receive(uint16_t pkt_len, uint8_t *buf)
     secure_zero(&r2, sizeof(r2));
 
     if (ret != 0) {
-        print_debug("RCV: GCM decrypt fail");
         secure_zero(&s_work.rcv, sizeof(s_work.rcv));
         secure_zero(saved_uuid,  UUID_SIZE);
         secure_zero(saved_name,  MAX_NAME_SIZE);
         print_error("Operation failed");
         return -1;
     }
-    print_debug("RCV: GCM ok, checking local RECEIVE perm");
 
     /* Verify OUR own RECEIVE permission for this file's group. */
     SECURE_BOOL_CHECK(ok1, ok2, validate_permission(saved_group_id, PERM_RECEIVE));
     if (!ok1) {
-        print_debug("RCV: no local RECEIVE perm for group");
         secure_zero(&s_work.rcv, sizeof(s_work.rcv));
         secure_zero(saved_uuid,  UUID_SIZE);
         secure_zero(saved_name,  MAX_NAME_SIZE);
@@ -595,7 +610,6 @@ int receive(uint16_t pkt_len, uint8_t *buf)
      * secure_write_file() pushes file_t (8277 B) — total ~8400 B, well within
      * the 15.8 KB stack budget.
      */
-    print_debug("RCV: writing to flash");
     ret = secure_write_file(command->write_slot, saved_group_id, saved_name,
                             s_work.rcv.ciphertext,  /* plaintext after in-place decrypt */
                             saved_contents_len, saved_uuid);
@@ -605,12 +619,10 @@ int receive(uint16_t pkt_len, uint8_t *buf)
     secure_zero(saved_name,  MAX_NAME_SIZE);
 
     if (ret != 0) {
-        print_debug("RCV: flash write fail");
         print_error("Operation failed");
         return -1;
     }
 
-    print_debug("RCV: success");
     write_packet(CONTROL_INTERFACE, RECEIVE_MSG, NULL, 0);
     return 0;
 }
@@ -631,8 +643,6 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
     uint16_t               r2_len, list_data_len;
     uint8_t                hmac_input[NONCE_SIZE + sizeof(list_response_t)];
 
-    print_debug("INT: enter");
-
     if (pkt_len < sizeof(interrogate_command_t)) {
         print_error("Operation failed");
         return -1;
@@ -641,23 +651,19 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
     if (!ok1) {
-        print_debug("INT: bad pin");
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
     }
-    print_debug("INT: pin ok");
 
     /* ---- R1: send challenge + auth + permission proof ---- */
     memset(&r1, 0, sizeof(r1));
     if (generate_nonce(r1.challenge) != 0) {
-        print_debug("INT: nonce fail");
         print_error("Operation failed");
         return -1;
     }
     if (hmac_sha256(TRANSFER_AUTH_KEY, r1.challenge, NONCE_SIZE,
                     HMAC_DOMAIN_INTERROGATE_REQ, r1.auth) != 0) {
-        print_debug("INT: R1 HMAC fail");
         secure_zero(&r1, sizeof(r1));
         print_error("Operation failed");
         return -1;
@@ -665,14 +671,11 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
     r1.perm_count = PERM_COUNT;
     serialize_permissions(global_permissions, PERM_COUNT, r1.perms);
     memcpy(r1.perm_mac, PERMISSION_MAC, HMAC_SIZE);
-    print_debug("INT: sending R1 on UART1");
     if (write_packet(TRANSFER_INTERFACE, INTERROGATE_MSG, &r1, sizeof(r1)) != MSG_OK) {
-        print_debug("INT: R1 write fail (no peer ACK)");
         secure_zero(&r1, sizeof(r1));
         print_error("Operation failed");
         return -1;
     }
-    print_debug("INT: R1 sent, waiting R2");
 
     /* ---- R2: receive filtered list + verify resp_auth ---- */
     memset(&r2, 0, sizeof(r2));
@@ -680,13 +683,11 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
     cmd    = 0;
     if (read_packet(TRANSFER_INTERFACE, &cmd, &r2, &r2_len) != MSG_OK ||
         cmd != INTERROGATE_MSG || r2_len < HMAC_SIZE) {
-        print_debug("INT: R2 timeout/wrong opcode/too short");
         secure_zero(&r1, sizeof(r1));
         secure_zero(&r2, sizeof(r2));
         print_error("Operation failed");
         return -1;
     }
-    print_debug("INT: R2 received, checking resp_auth");
 
     list_data_len = r2_len - HMAC_SIZE;
     memcpy(hmac_input,              r1.challenge, NONCE_SIZE);
@@ -695,21 +696,18 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
     if (!hmac_verify(TRANSFER_AUTH_KEY,
                      hmac_input, (size_t)(NONCE_SIZE + list_data_len),
                      HMAC_DOMAIN_INTERROGATE_RSP, r2.resp_auth)) {
-        print_debug("INT: R2 HMAC fail");
         secure_zero(hmac_input, sizeof(hmac_input));
         secure_zero(&r1, sizeof(r1));
         secure_zero(&r2, sizeof(r2));
         print_error("Operation failed");
         return -1;
     }
-    print_debug("INT: R2 HMAC ok, forwarding list to host");
 
     secure_zero(hmac_input, sizeof(hmac_input));
     secure_zero(&r1, sizeof(r1));
 
     write_packet(CONTROL_INTERFACE, INTERROGATE_MSG, &r2.list, list_data_len);
     secure_zero(&r2, sizeof(r2));
-    print_debug("INT: success");
     return 0;
 }
 
@@ -732,9 +730,6 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
  *
  * uart_drain_rx() is non-blocking — it only discards bytes already in the
  * FIFO right now, so it cannot accidentally consume the peer's fresh R1.
- * The old blocking drain used uart_readbyte_timeout() which waited up to
- * 3 seconds per byte and consumed legitimate R1 header bytes that arrived
- * while the drain was running, causing an inter-board deadlock.
  *
  * RECEIVE_MSG stack peak:
  *   union u { file_t stored; receive_r4_t fdata } = 8277 B
@@ -767,18 +762,14 @@ int listen(uint16_t pkt_len, uint8_t *buf)
     (void)pkt_len;
     (void)buf;
 
-    print_debug("LSN: enter");
-
     /* Ack the host immediately so the test framework can fire the peer command
      * without waiting for us to complete the UART1 exchange first. */
     write_packet(CONTROL_INTERFACE, LISTEN_MSG, NULL, 0);
-    print_debug("LSN: host ack sent, draining stale UART1 bytes");
 
     /* Flush stale bytes already sitting in the RX FIFO from a prior exchange.
      * uart_drain_rx is non-blocking — it only discards bytes present NOW,
      * so it cannot accidentally consume the peer's fresh R1 header. */
     (void)uart_drain_rx(TRANSFER_INTERFACE, MAX_SYNC_DISCARD);
-    print_debug("LSN: blocking on UART1");
 
     memset(first_buf, 0, sizeof(first_buf));
     if (read_packet(TRANSFER_INTERFACE, &cmd, first_buf, &first_len) != MSG_OK) {
@@ -786,18 +777,14 @@ int listen(uint16_t pkt_len, uint8_t *buf)
          * Host already received its LISTEN ack and exited; do NOT call
          * print_error() here — write_packet(CONTROL_INTERFACE, ...) would
          * block forever waiting for an ACK from a disconnected host. */
-        print_debug("LSN: UART1 R1 timeout/err, returning silently");
         return -1;
     }
-    print_debug("LSN: got R1 from peer on UART1");
 
     /* ================================================================== */
     /* RECEIVE_MSG — sender (responder) side                               */
     /* ================================================================== */
     if (cmd == RECEIVE_MSG) {
         volatile bool ok1, ok2;
-
-        print_debug("LSN-RCV: branch entered");
 
         /* Union: file_t and receive_r4_t share 8277 B of stack.
          * stored arm is live while we read the file and save metadata.
@@ -825,17 +812,14 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         int           ret;
 
         if (first_len != sizeof(receive_r1_t)) {
-            print_debug("LSN-RCV: R1 wrong length");
             return -1;
         }
         if (!validate_slot(r1->slot)) {
-            print_debug("LSN-RCV: R1 bad slot");
             return -1;
         }
 
         slot_req = r1->slot;
         memcpy(recv_chal, r1->recv_chal, NONCE_SIZE);
-        print_debug("LSN-RCV: R1 ok, reading file from flash");
 
         /* Load encrypted file from flash — check in_use inline.
          * Do NOT call is_slot_in_use() here: that would put a second
@@ -844,11 +828,9 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         if (read_file(slot_req, &u.stored) != 0 ||
             u.stored.in_use != FILE_IN_USE ||
             !validate_contents_len(u.stored.contents_len)) {
-            print_debug("LSN-RCV: read_file fail / slot empty / bad len");
             secure_zero(&u.stored, sizeof(u.stored));
             return -1;
         }
-        print_debug("LSN-RCV: file loaded ok");
 
         /* Save metadata before u is repurposed for the fdata arm. */
         saved_group_id     = u.stored.group_id;
@@ -858,7 +840,6 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         {
             const filesystem_entry_t *fat = get_file_metadata(slot_req);
             if (fat == NULL) {
-                print_debug("LSN-RCV: FAT lookup fail");
                 secure_zero(&u.stored, sizeof(u.stored));
                 return -1;
             }
@@ -896,21 +877,17 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         secure_zero(&u.stored, sizeof(u.stored));   /* stored arm done */
 
         if (ret != 0) {
-            print_debug("LSN-RCV: storage GCM decrypt fail");
             secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
             secure_zero(&r2, sizeof(r2));
             return -1;
         }
-        print_debug("LSN-RCV: storage decrypt ok, sending R2");
 
         if (write_packet(TRANSFER_INTERFACE, RECEIVE_MSG, &r2, sizeof(r2)) != MSG_OK) {
-            print_debug("LSN-RCV: R2 write fail (no peer ACK)");
             secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
             secure_zero(&r2, sizeof(r2));
             return -1;
         }
         secure_zero(&r2, sizeof(r2));
-        print_debug("LSN-RCV: R2 sent, waiting R3");
 
         /*
          * R2 has been delivered — receiver is now committed to waiting for R4.
@@ -925,55 +902,44 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         r3_cmd = 0;
         if (read_packet(TRANSFER_INTERFACE, &r3_cmd, &r3, &r3_len) != MSG_OK ||
             r3_cmd != RECEIVE_MSG || r3_len != sizeof(r3)) {
-            print_debug("LSN-RCV: R3 timeout/wrong opcode/wrong len");
             secure_zero(recv_chal, NONCE_SIZE);
             secure_zero(send_chal, NONCE_SIZE);
             secure_zero(&r3, sizeof(r3));
             secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
-            /* Abort: unblock receiver waiting for R4. */
             (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
             return -1;
         }
-        print_debug("LSN-RCV: R3 received, validating perms + HMAC");
         if (!validate_perm_count(r3.perm_count) ||
             !validate_perm_bytes(r3.perms, r3.perm_count) ||
             !verify_perm_mac(r3.perm_count, r3.perms, r3.perm_mac)) {
-            print_debug("LSN-RCV: R3 perm invalid or MAC fail");
             secure_zero(recv_chal, NONCE_SIZE);
             secure_zero(send_chal, NONCE_SIZE);
             secure_zero(&r3, sizeof(r3));
             secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
-            /* Abort: unblock receiver waiting for R4. */
             (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
             return -1;
         }
         if (!hmac_verify(TRANSFER_AUTH_KEY, send_chal, NONCE_SIZE,
                          HMAC_DOMAIN_RECEIVER, r3.recv_auth)) {
-            print_debug("LSN-RCV: R3 recv_auth HMAC fail");
             secure_zero(recv_chal, NONCE_SIZE);
             secure_zero(send_chal, NONCE_SIZE);
             secure_zero(&r3, sizeof(r3));
             secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
-            /* Abort: unblock receiver waiting for R4. */
             (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
             return -1;
         }
-        print_debug("LSN-RCV: R3 ok, checking receiver has RECEIVE perm");
 
         /* Receiver must have RECEIVE permission for this file's group.
          * Loop counter checked inside perm_bytes_has_receive. */
         if (!perm_bytes_has_receive(r3.perms, r3.perm_count, saved_group_id)) {
-            print_debug("LSN-RCV: receiver lacks RECEIVE perm");
             secure_zero(recv_chal, NONCE_SIZE);
             secure_zero(send_chal, NONCE_SIZE);
             secure_zero(&r3, sizeof(r3));
             secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
-            /* Abort: unblock receiver waiting for R4. */
             (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
             return -1;
         }
         secure_zero(&r3, sizeof(r3));
-        print_debug("LSN-RCV: perm ok, building R4");
 
         /* ---- R4: build and send encrypted file ---- */
         memset(&u.fdata, 0, sizeof(u.fdata));    /* fdata arm now active */
@@ -981,7 +947,6 @@ int listen(uint16_t pkt_len, uint8_t *buf)
             secure_zero(recv_chal, NONCE_SIZE);
             secure_zero(send_chal, NONCE_SIZE);
             secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
-            /* Abort: unblock receiver waiting for R4. */
             (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
             return -1;
         }
@@ -1009,24 +974,19 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
 
         if (ret != 0) {
-            print_debug("LSN-RCV: transfer GCM encrypt fail");
             secure_zero(&u.fdata, sizeof(u.fdata));
-            /* Abort: unblock receiver waiting for R4. */
             (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
             return -1;
         }
 
-        print_debug("LSN-RCV: sending R4 on UART1");
         if (write_packet(TRANSFER_INTERFACE, RECEIVE_MSG,
                          &u.fdata,
                          (uint16_t)(FILE_DATA_HEADER_SIZE + saved_contents_len)) != MSG_OK) {
-            print_debug("LSN-RCV: R4 write fail (no peer ACK)");
             secure_zero(&u.fdata, sizeof(u.fdata));
             return -1;
         }
 
         secure_zero(&u.fdata, sizeof(u.fdata));
-        print_debug("LSN-RCV: R4 sent, done");
         return 0;
     } /* end RECEIVE_MSG */
 
@@ -1037,15 +997,12 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         interrogate_r1_t  *ir1 = (interrogate_r1_t *)first_buf;
         interrogate_r2_t   ir2;
         file_header_t      hdr;
-      list_response_t    resp_list;
+        list_response_t    resp_list;
         uint8_t            hmac_input[NONCE_SIZE + sizeof(list_response_t)];
         uint8_t            slot;
         uint16_t           send_len;
 
-        print_debug("LSN-INT: branch entered");
-
         if (first_len != sizeof(interrogate_r1_t)) {
-            print_debug("LSN-INT: R1 wrong length");
             return -1;
         }
 
@@ -1053,15 +1010,12 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         if (!validate_perm_count(ir1->perm_count) ||
             !validate_perm_bytes(ir1->perms, ir1->perm_count) ||
             !verify_perm_mac(ir1->perm_count, ir1->perms, ir1->perm_mac)) {
-            print_debug("LSN-INT: R1 perm MAC invalid");
             return -1;
         }
         if (!hmac_verify(TRANSFER_AUTH_KEY, ir1->challenge, NONCE_SIZE,
                          HMAC_DOMAIN_INTERROGATE_REQ, ir1->auth)) {
-            print_debug("LSN-INT: R1 auth HMAC fail");
             return -1;
         }
-        print_debug("LSN-INT: R1 auth ok, building filtered list");
 
         /*
          * Build the filtered file list.
@@ -1093,7 +1047,6 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         if (hmac_sha256(TRANSFER_AUTH_KEY,
                         hmac_input, (size_t)(NONCE_SIZE + send_len),
                         HMAC_DOMAIN_INTERROGATE_RSP, ir2.resp_auth) != 0) {
-            print_debug("LSN-INT: R2 HMAC fail");
             secure_zero(hmac_input, sizeof(hmac_input));
             return -1;
         }
@@ -1103,16 +1056,13 @@ int listen(uint16_t pkt_len, uint8_t *buf)
 
         if (write_packet(TRANSFER_INTERFACE, INTERROGATE_MSG,
                          &ir2, (uint16_t)(HMAC_SIZE + send_len)) != MSG_OK) {
-            print_debug("LSN-INT: R2 write fail (no peer ACK)");
             secure_zero(&ir2, sizeof(ir2));
             return -1;
         }
         secure_zero(&ir2, sizeof(ir2));
-        print_debug("LSN-INT: R2 sent, done");
         return 0;
     } /* end INTERROGATE_MSG */
 
     /* Unknown opcode on TRANSFER_INTERFACE — ignore silently. */
-    print_debug("LSN: unknown R1 opcode, ignoring");
     return -1;
 }
