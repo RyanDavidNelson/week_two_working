@@ -92,6 +92,35 @@ void security_halt(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Stack canary                                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * __stack_chk_guard — zero at reset (.bss), seeded in init() before
+ * any instrumented function returns.
+ *
+ * Format (little-endian Cortex-M0+, byte 0 = lowest address):
+ *   byte 0 : 0x00  (null — corrupted first by any upward string smash)
+ *   bytes 1-3 : random TRNG bytes
+ *
+ * Seeding: init() calls trng_read_word() and masks off the low byte:
+ *   __stack_chk_guard = trng_read_word() & 0xFFFFFF00U;
+ *
+ * The canary is volatile so the compiler cannot cache the load in a
+ * register; each entry/exit check hits memory independently.
+ */
+volatile uint32_t __stack_chk_guard = 0;
+
+/*
+ * __stack_chk_fail — compiler hook on canary mismatch.
+ * No cleanup, no error output — leaks no information.
+ */
+void __attribute__((noreturn)) __stack_chk_fail(void)
+{
+    security_halt();
+}
+
+/* ------------------------------------------------------------------ */
 /* Hardware TRNG Functions                                             */
 /* ------------------------------------------------------------------ */
 

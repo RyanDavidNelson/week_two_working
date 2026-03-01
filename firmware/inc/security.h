@@ -119,6 +119,37 @@ void secure_zero(void *ptr, size_t len);
 void security_halt(void) __attribute__((noreturn));
 
 /* ------------------------------------------------------------------ */
+/* Stack canary                                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * __stack_chk_guard — runtime stack canary, seeded from TRNG in init().
+ *
+ * The compiler (-fstack-protector-strong) reads this at instrumented
+ * function entry, stores a copy just above the return address, then
+ * re-reads and compares at function exit.  Any linear stack smash that
+ * reaches the return address must first corrupt the stored copy.
+ *
+ * Layout on little-endian Cortex-M0+:
+ *   byte 0 (lowest address, overwritten first by upward smash) == 0x00
+ *   bytes 1-3 == random TRNG bytes
+ *
+ * The embedded null (byte 0) means any string-copy overwrite that would
+ * produce a non-zero value at that position corrupts the canary before
+ * reaching the return address.  The 24 random bits in bytes 1-3 defeat
+ * non-string overwrites.
+ *
+ * Declared volatile so the compiler cannot cache the load in a register.
+ */
+extern volatile uint32_t __stack_chk_guard;
+
+/*
+ * __stack_chk_fail — compiler hook invoked on canary mismatch.
+ * Delegates immediately to security_halt(); never returns.
+ */
+void __stack_chk_fail(void) __attribute__((noreturn));
+
+/* ------------------------------------------------------------------ */
 /* Hardware TRNG Functions                                             */
 /* ------------------------------------------------------------------ */
 

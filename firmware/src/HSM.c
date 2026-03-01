@@ -45,6 +45,27 @@ void init(void)
             delay_ms(500);
         }
     }
+
+    /*
+     * Seed the stack canary from TRNG.
+     *
+     * Must happen after trng_init() and before any instrumented function
+     * returns.  All command handlers run inside the main() while(1) loop
+     * which starts after init() returns — no instrumented function has
+     * returned yet at this point, so the window of zero-canary exposure
+     * is exactly the startup code before this line.
+     *
+     * Canary format (little-endian Cortex-M0+):
+     *   byte 0 (lowest address, hit first by upward smash) = 0x00
+     *   bytes 1-3 = random TRNG bytes
+     *
+     * Masking off the low byte embeds a null terminator at byte 0.
+     * A string-copy overwrite that produces any non-zero value at byte 0
+     * corrupts the canary before reaching the saved return address.
+     * The 24 random bits in bytes 1-3 defeat non-string overwrites.
+     */
+    uint32_t raw_canary = trng_read_word();
+    __stack_chk_guard   = raw_canary & 0xFFFFFF00U;
 }
 
 int main(void)

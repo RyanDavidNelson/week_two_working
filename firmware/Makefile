@@ -92,7 +92,16 @@ CFLAGS += -I.. \
     -mcpu=cortex-m0plus \
     -march=thumbv6m \
     -mfloat-abi=soft \
-    -mthumb
+    -mthumb \
+    -fstack-protector-strong
+
+# -fstack-protector-strong: instrument every function that has a local array,
+# an address-taken local, or a local struct/union — the realistic smash surface.
+# The compiler inserts a load of __stack_chk_guard at entry and a matching
+# check at exit; mismatch calls __stack_chk_fail(), which invokes security_halt().
+# __stack_chk_guard is defined in security.c and seeded from TRNG in init().
+# wolfSSL objects are compiled separately below and do NOT receive this flag —
+# wolfcrypt internals are not attack-facing and the overhead is unnecessary.
 
 # =============================================================================
 # Linker flags
@@ -123,9 +132,11 @@ $(BUILDDIR)/%.so: ./src/%.c | $(BUILDDIR)
 	@ $(CC) $(CFLAGS) -c $< -o $@
 
 # wolfSSL source files → BUILDDIR
+# Compiled without -fstack-protector-strong: wolfcrypt is not attack-facing
+# and the flag would pull in libssp symbols not available on this bare-metal target.
 $(BUILDDIR)/%.so: $(WOLFSSL_SRC)/%.c | $(BUILDDIR)
 	@ echo Building WolfSSL: $@
-	@ $(CC) $(CFLAGS) -O2 -c $< -o $@
+	@ $(CC) $(CFLAGS) -fno-stack-protector -O2 -c $< -o $@
 
 $(BUILDDIR)/$(NAME).elf: $(OBJECTS)
 	@ echo Linking $@
