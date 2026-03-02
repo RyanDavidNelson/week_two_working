@@ -33,27 +33,27 @@
  * Key usage:
  *   STORAGE_KEY       — at-rest AES-GCM (via secure_{read,write}_file)
  *   TRANSFER_KEY      — in-transit AES-GCM (receive R4, listen R4 tx)
- *   TRANSFER_AUTH_KEY — all HMAC challenge-response and permission MAC
+ *   TRANSFER_AUTH_KEY — HMAC handshake challenge-response
+ *   PERM_MAC_KEY      — HMAC for PERMISSION_MAC verification only
+ *   CHALLENGE_TWEAK   — nonce XOR mask applied before every HMAC call
  *   PIN_KEY           — PIN verification via SECURE_PIN_CHECK
  *
  * FIX FI1 (HIGH): Every `if (!ok1)` that follows a SECURE_PIN_CHECK or
  *   SECURE_BOOL_CHECK has been changed to `if (!(ok1 & ok2))`.
  *
- *   Why: SECURE_BOOL_CHECK/SECURE_PIN_CHECK guarantee ok1 == ok2 on normal
- *   paths (or halt on disagreement).  The subsequent branch `if (!ok1)` is a
- *   single instruction — a Chip Whisperer voltage glitch can skip or mispredict
- *   it, bypassing the check entirely even though the macro detected nothing.
+ * FIX SCA3 (HIGH): PERM_MAC_KEY is architecturally split from TRANSFER_AUTH_KEY.
+ *   verify_perm_mac() now uses PERM_MAC_KEY.  PERM_MAC_KEY never enters any
+ *   runtime HMAC hardware call — it exists only as a flash constant.  CPA
+ *   on handshake traces recovers TRANSFER_AUTH_KEY but not PERM_MAC_KEY.
  *
- *   `if (!(ok1 & ok2))` requires two independent volatile reads from separate
- *   stack locations.  A single glitch that corrupts ok1's load cannot
- *   simultaneously corrupt ok2's load; AND'ing them means a glitch that forces
- *   ok1 high while ok2 stays low (correct) still produces !(1 & 0) = true,
- *   keeping the guard active.  The attacker now needs to win two simultaneous
- *   glitches (double-glitch), which is explicitly out of scope.
+ * FIX SCA4 (HIGH): CHALLENGE_TWEAK is XOR'd with every handshake/interrogate
+ *   nonce before it enters hmac_sha256().  Both sides of an exchange apply the
+ *   same deployment-wide tweak, so authentication is unaffected.  An attacker
+ *   who sends chosen nonces cannot predict the actual HMAC input at trace
+ *   collection time, breaking the chosen-input advantage required for CPA.
  *
- * FIX P2 (LOW): interrogate() now bounds-checks r2.list.n_files against
- *   list_data_len before forwarding to the host, preventing a compromised
- *   peer from triggering host-side OOB reads with a crafted n_files value.
+ * FIX P2 (LOW): interrogate() bounds-checks r2.list.n_files against
+ *   list_data_len before forwarding to the host.
  *
  * FIX #3: write() validates name AFTER the PIN check.
  * FIX #5: All print_debug() calls removed from production build.
@@ -117,7 +117,7 @@ static void serialize_permissions(const group_permission_t *src,
                                   uint8_t count, uint8_t *out)
 {
     uint8_t i;
-    for (i = 0; i < count; i++) {
+    for (i = 0U; i < count; i++) {
         serialize_one_perm(&src[i], out + (size_t)i * PERM_SERIAL_SIZE);
     }
 }
@@ -130,7 +130,7 @@ static void serialize_permissions(const group_permission_t *src,
 static bool validate_perm_bytes(const uint8_t *perms, uint8_t perm_count)
 {
     uint8_t i;
-    for (i = 0; i < perm_count; i++) {
+    for (i = 0U; i < perm_count; i++) {
         const uint8_t *p = perms + (size_t)i * PERM_SERIAL_SIZE;
         if (!validate_bool(p[2]) || !validate_bool(p[3]) || !validate_bool(p[4])) {
             return false;
@@ -147,7 +147,7 @@ static bool perm_bytes_has_receive(const uint8_t *perms, uint8_t perm_count,
                                    uint16_t group_id)
 {
     uint8_t i;
-    for (i = 0; i < perm_count; i++) {
+    for (i = 0U; i < perm_count; i++) {
         const uint8_t *p   = perms + (size_t)i * PERM_SERIAL_SIZE;
         uint16_t       gid = (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
         if (gid == group_id && p[4] == 1u) { return true; }
@@ -157,7 +157,11 @@ static bool perm_bytes_has_receive(const uint8_t *perms, uint8_t perm_count,
 
 /*
  * Verify the PERMISSION_MAC attached to a received permission blob.
- * PERMISSION_MAC = HMAC(TRANSFER_AUTH_KEY, count || perms || "permission").
+ * PERMISSION_MAC = HMAC(PERM_MAC_KEY, count || perms || "permission").
+ *
+ * FIX SCA3: uses PERM_MAC_KEY, not TRANSFER_AUTH_KEY.  PERM_MAC_KEY never
+ * enters any runtime HMAC hardware call — it only exists as a flash constant.
+ * CPA on handshake traces cannot recover it.
  */
 static bool verify_perm_mac(uint8_t perm_count, const uint8_t *perms,
                              const uint8_t *mac)
@@ -165,9 +169,31 @@ static bool verify_perm_mac(uint8_t perm_count, const uint8_t *perms,
     uint8_t input[1 + MAX_PERMS * PERM_SERIAL_SIZE];
     input[0] = perm_count;
     memcpy(input + 1, perms, (size_t)perm_count * PERM_SERIAL_SIZE);
-    return hmac_verify(TRANSFER_AUTH_KEY,
+    return hmac_verify(PERM_MAC_KEY,                               /* FIX SCA3 */
                        input, 1 + (size_t)perm_count * PERM_SERIAL_SIZE,
                        HMAC_DOMAIN_PERMISSION, mac);
+}
+
+/*
+ * XOR nonce with CHALLENGE_TWEAK into tweaked[NONCE_SIZE].
+ *
+ * FIX SCA4: breaks the chosen-input advantage required for CPA.  The attacker
+ * controls the nonce bytes on the wire but cannot predict the actual HMAC
+ * first-block input without knowing CHALLENGE_TWEAK (a deployment secret).
+ * Both sides of an exchange apply the same tweak so authentication is
+ * unaffected.
+ *
+ * Call apply_tweak(), pass tweaked to hmac_sha256/hmac_verify, then
+ * secure_zero(tweaked, NONCE_SIZE) after the call.
+ *
+ * Loop counter i in [0, NONCE_SIZE); terminates when i == NONCE_SIZE.
+ */
+static void apply_tweak(const uint8_t *nonce, uint8_t *tweaked)
+{
+    uint8_t i;
+    for (i = 0U; i < NONCE_SIZE; i++) {
+        tweaked[i] = nonce[i] ^ CHALLENGE_TWEAK[i];
+    }
 }
 
 /*
@@ -185,7 +211,7 @@ static void generate_list_files(list_response_t *file_list)
 
     file_list->n_files = 0;
 
-    for (slot = 0; slot < MAX_FILE_COUNT; slot++) {
+    for (slot = 0U; slot < MAX_FILE_COUNT; slot++) {
         if (read_file(slot, &temp_file) != 0) { continue; }
         if (temp_file.in_use != FILE_IN_USE) {
             secure_zero(&temp_file, sizeof(temp_file));
@@ -223,14 +249,7 @@ int list(uint16_t pkt_len, uint8_t *buf)
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
 
-    /*
-     * FI1 fix: `if (!(ok1 & ok2))` instead of `if (!ok1)`.
-     * SECURE_PIN_CHECK guarantees ok1 == ok2 or halts, so in normal
-     * operation ok1 & ok2 == ok1.  Under a single glitch that forces ok1's
-     * volatile load to true while ok2's load stays false (correct value),
-     * the AND keeps the guard active: !(true & false) = true → reject.
-     */
-    if (!(ok1 & ok2)) {
+    if (!(ok1 & ok2)) {   /* FI1 fix */
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
@@ -394,9 +413,11 @@ int write(uint16_t pkt_len, uint8_t *buf)
  * RECEIVE — initiator side of the 4-round authenticated file transfer.
  *
  * R1 → send slot + recv_chal
- * R2 ← verify sender_auth = HMAC(TAK, recv_chal || "sender")
- * R3 → send recv_auth + own permissions + PERMISSION_MAC
+ * R2 ← verify sender_auth = HMAC(TAK, recv_chal XOR TWEAK || "sender")
+ * R3 → send recv_auth = HMAC(TAK, send_chal XOR TWEAK || "receiver") + perms
  * R4 ← verify GCM tag; check OWN RECEIVE permission; write to write_slot
+ *
+ * CHALLENGE_TWEAK is applied to every nonce before the HMAC call (FIX SCA4).
  *
  * STACK FIX: receive_r4_t (8273 B) lives in s_work.rcv (static).
  * Approach: receive R4 into s_work.rcv, save the 81-byte header to small
@@ -415,6 +436,7 @@ int receive(uint16_t pkt_len, uint8_t *buf)
     uint16_t           r2_len, r4_len;
     uint8_t            transfer_aad[TRANSFER_AAD_SIZE];
     size_t             transfer_aad_len;
+    uint8_t            tweaked_chal[NONCE_SIZE];   /* SCA4: nonce XOR tweak */
     int                ret;
 
     /* Saved R4 header fields (81 bytes total) — fits on stack. */
@@ -468,23 +490,34 @@ int receive(uint16_t pkt_len, uint8_t *buf)
         print_error("Operation failed");
         return -1;
     }
-    if (!hmac_verify(TRANSFER_AUTH_KEY, r1.recv_chal, NONCE_SIZE,
+
+    /* SCA4: verify sender_auth over tweaked recv_chal. */
+    apply_tweak(r1.recv_chal, tweaked_chal);
+    if (!hmac_verify(TRANSFER_AUTH_KEY, tweaked_chal, NONCE_SIZE,
                      HMAC_DOMAIN_SENDER, r2.sender_auth)) {
+        secure_zero(tweaked_chal, NONCE_SIZE);
         secure_zero(&r1, sizeof(r1));
         secure_zero(&r2, sizeof(r2));
         print_error("Operation failed");
         return -1;
     }
+    secure_zero(tweaked_chal, NONCE_SIZE);
 
     /* ---- R3: send receiver auth + own permission proof ---- */
     memset(&r3, 0, sizeof(r3));
-    if (hmac_sha256(TRANSFER_AUTH_KEY, r2.send_chal, NONCE_SIZE,
+
+    /* SCA4: compute recv_auth over tweaked send_chal. */
+    apply_tweak(r2.send_chal, tweaked_chal);
+    if (hmac_sha256(TRANSFER_AUTH_KEY, tweaked_chal, NONCE_SIZE,
                     HMAC_DOMAIN_RECEIVER, r3.recv_auth) != 0) {
+        secure_zero(tweaked_chal, NONCE_SIZE);
         secure_zero(&r1, sizeof(r1));
         secure_zero(&r2, sizeof(r2));
         print_error("Operation failed");
         return -1;
     }
+    secure_zero(tweaked_chal, NONCE_SIZE);
+
     r3.perm_count = PERM_COUNT;
     serialize_permissions(global_permissions, PERM_COUNT, r3.perms);
     memcpy(r3.perm_mac, PERMISSION_MAC, HMAC_SIZE);
@@ -577,7 +610,7 @@ int receive(uint16_t pkt_len, uint8_t *buf)
      * on failure, and the FI1 fix below hardens the branch.
      */
     SECURE_BOOL_CHECK(ok1, ok2, validate_permission(saved_group_id, PERM_RECEIVE));
-    if (!(ok1 & ok2)) {   /* FI1 fix: AND both volatile reads */
+    if (!(ok1 & ok2)) {   /* FI1 fix */
         secure_zero(&s_work.rcv, sizeof(s_work.rcv));
         secure_zero(saved_uuid,  UUID_SIZE);
         secure_zero(saved_name,  MAX_NAME_SIZE);
@@ -612,15 +645,13 @@ int receive(uint16_t pkt_len, uint8_t *buf)
 /*
  * INTERROGATE — initiator side.
  *
- * R1 → send challenge + auth + own permissions
+ * R1 → send challenge XOR TWEAK auth + own permissions
  * R2 ← verify resp_auth; forward filtered list to host
  *
+ * CHALLENGE_TWEAK is applied to the challenge nonce (FIX SCA4).
+ *
  * FIX P2 (LOW): r2.list.n_files is bounds-checked against list_data_len
- * before the list is forwarded to the host.  A compromised peer (sharing
- * TRANSFER_AUTH_KEY) could craft a valid HMAC over a packet where n_files
- * claims more entries than the data contains, causing the host tool to
- * read past the end of the list buffer.  The check below ensures
- * n_files * sizeof(file_metadata_t) + sizeof(uint32_t) <= list_data_len.
+ * before the list is forwarded to the host.
  */
 int interrogate(uint16_t pkt_len, uint8_t *buf)
 {
@@ -631,6 +662,7 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
     msg_type_t             cmd;
     uint16_t               r2_len, list_data_len;
     uint8_t                hmac_input[NONCE_SIZE + sizeof(list_response_t)];
+    uint8_t                tweaked_chal[NONCE_SIZE];   /* SCA4 */
 
     if (pkt_len < sizeof(interrogate_command_t)) {
         print_error("Operation failed");
@@ -651,12 +683,18 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
         print_error("Operation failed");
         return -1;
     }
-    if (hmac_sha256(TRANSFER_AUTH_KEY, r1.challenge, NONCE_SIZE,
+
+    /* SCA4: authenticate over tweaked challenge so responder CPA sees unknown input. */
+    apply_tweak(r1.challenge, tweaked_chal);
+    if (hmac_sha256(TRANSFER_AUTH_KEY, tweaked_chal, NONCE_SIZE,
                     HMAC_DOMAIN_INTERROGATE_REQ, r1.auth) != 0) {
+        secure_zero(tweaked_chal, NONCE_SIZE);
         secure_zero(&r1, sizeof(r1));
         print_error("Operation failed");
         return -1;
     }
+    secure_zero(tweaked_chal, NONCE_SIZE);
+
     r1.perm_count = PERM_COUNT;
     serialize_permissions(global_permissions, PERM_COUNT, r1.perms);
     memcpy(r1.perm_mac, PERMISSION_MAC, HMAC_SIZE);
@@ -679,8 +717,12 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
     }
 
     list_data_len = r2_len - HMAC_SIZE;
-    memcpy(hmac_input,              r1.challenge, NONCE_SIZE);
+
+    /* SCA4: build hmac_input with tweaked challenge prefix. */
+    apply_tweak(r1.challenge, tweaked_chal);
+    memcpy(hmac_input,              tweaked_chal, NONCE_SIZE);
     memcpy(hmac_input + NONCE_SIZE, &r2.list,     list_data_len);
+    secure_zero(tweaked_chal, NONCE_SIZE);
 
     if (!hmac_verify(TRANSFER_AUTH_KEY,
                      hmac_input, (size_t)(NONCE_SIZE + list_data_len),
@@ -746,6 +788,8 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
  *
  * DESYNC FIX: every error path that fires AFTER R2 was sent sends a
  * best-effort ERROR_MSG on TRANSFER_INTERFACE before returning.
+ *
+ * FIX SCA4: CHALLENGE_TWEAK applied to all nonce-based HMAC calls.
  */
 int listen(uint16_t pkt_len, uint8_t *buf)
 {
@@ -770,9 +814,10 @@ int listen(uint16_t pkt_len, uint8_t *buf)
     /* RECEIVE_MSG — sender (responder) side                               */
     /* ================================================================== */
     if (cmd == RECEIVE_MSG) {
-        volatile bool ok1, ok2;   /* unused in listen() sender path — kept for future FI hardening */
+        volatile bool ok1, ok2;   /* kept for future FI hardening */
 
-        /* Union: file_t and receive_r4_t share 8277 B of stack. */
+        /* Union: file_t and receive_r4_t share 8277 B of stack.
+         * Only one arm is live at a time. */
         union {
             file_t       stored;
             receive_r4_t fdata;
@@ -785,6 +830,7 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         uint16_t      r3_len;
         uint8_t       recv_chal[NONCE_SIZE];
         uint8_t       send_chal[NONCE_SIZE];
+        uint8_t       tweaked_chal[NONCE_SIZE];   /* SCA4 */
         char          saved_name[MAX_NAME_SIZE];
         uint16_t      saved_group_id;
         uint16_t      saved_contents_len;
@@ -835,12 +881,16 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         }
         memcpy(send_chal, r2.send_chal, NONCE_SIZE);
 
-        if (hmac_sha256(TRANSFER_AUTH_KEY, recv_chal, NONCE_SIZE,
+        /* SCA4: sender_auth computed over tweaked recv_chal. */
+        apply_tweak(recv_chal, tweaked_chal);
+        if (hmac_sha256(TRANSFER_AUTH_KEY, tweaked_chal, NONCE_SIZE,
                         HMAC_DOMAIN_SENDER, r2.sender_auth) != 0) {
+            secure_zero(tweaked_chal, NONCE_SIZE);
             secure_zero(&u.stored, sizeof(u.stored));
             secure_zero(&r2, sizeof(r2));
             return -1;
         }
+        secure_zero(tweaked_chal, NONCE_SIZE);
 
         /* Decrypt stored file into s_work.plain with STORAGE_KEY. */
         aad_len = build_storage_aad(slot_req, saved_uuid,
@@ -897,8 +947,12 @@ int listen(uint16_t pkt_len, uint8_t *buf)
             (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
             return -1;
         }
-        if (!hmac_verify(TRANSFER_AUTH_KEY, send_chal, NONCE_SIZE,
+
+        /* SCA4: verify recv_auth over tweaked send_chal. */
+        apply_tweak(send_chal, tweaked_chal);
+        if (!hmac_verify(TRANSFER_AUTH_KEY, tweaked_chal, NONCE_SIZE,
                          HMAC_DOMAIN_RECEIVER, r3.recv_auth)) {
+            secure_zero(tweaked_chal, NONCE_SIZE);
             secure_zero(recv_chal, NONCE_SIZE);
             secure_zero(send_chal, NONCE_SIZE);
             secure_zero(&r3, sizeof(r3));
@@ -906,6 +960,7 @@ int listen(uint16_t pkt_len, uint8_t *buf)
             (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
             return -1;
         }
+        secure_zero(tweaked_chal, NONCE_SIZE);
 
         /* Receiver must have RECEIVE permission for this file's group. */
         if (!perm_bytes_has_receive(r3.perms, r3.perm_count, saved_group_id)) {
@@ -976,6 +1031,7 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         file_header_t      hdr;
         list_response_t    resp_list;
         uint8_t            hmac_input[NONCE_SIZE + sizeof(list_response_t)];
+        uint8_t            tweaked_chal[NONCE_SIZE];   /* SCA4 */
         uint8_t            slot;
         uint16_t           send_len;
 
@@ -987,10 +1043,15 @@ int listen(uint16_t pkt_len, uint8_t *buf)
             !verify_perm_mac(ir1->perm_count, ir1->perms, ir1->perm_mac)) {
             return -1;
         }
-        if (!hmac_verify(TRANSFER_AUTH_KEY, ir1->challenge, NONCE_SIZE,
+
+        /* SCA4: verify interrogate_req auth over tweaked challenge. */
+        apply_tweak(ir1->challenge, tweaked_chal);
+        if (!hmac_verify(TRANSFER_AUTH_KEY, tweaked_chal, NONCE_SIZE,
                          HMAC_DOMAIN_INTERROGATE_REQ, ir1->auth)) {
+            secure_zero(tweaked_chal, NONCE_SIZE);
             return -1;
         }
+        secure_zero(tweaked_chal, NONCE_SIZE);
 
         /*
          * Build filtered file list.
@@ -998,7 +1059,7 @@ int listen(uint16_t pkt_len, uint8_t *buf)
          * Loop counter slot in [0, MAX_FILE_COUNT); terminates at MAX_FILE_COUNT.
          */
         memset(&resp_list, 0, sizeof(resp_list));
-        for (slot = 0; slot < MAX_FILE_COUNT; slot++) {
+        for (slot = 0U; slot < MAX_FILE_COUNT; slot++) {
             if (read_file_header(slot, &hdr) != 0) { continue; }
             /* Include slot only if requester has RECEIVE for this group. */
             if (!perm_bytes_has_receive(ir1->perms, ir1->perm_count, hdr.group_id)) {
@@ -1012,11 +1073,14 @@ int listen(uint16_t pkt_len, uint8_t *buf)
             resp_list.n_files = idx + 1;
         }
 
-        /* Build and send R2: resp_auth || list. */
+        /* Build and send R2: resp_auth || list.
+         * SCA4: resp_auth is over tweaked challenge prefix || list body. */
         send_len = (uint16_t)LIST_PKT_LEN(resp_list.n_files);
 
-        memcpy(hmac_input,              ir1->challenge, NONCE_SIZE);
-        memcpy(hmac_input + NONCE_SIZE, &resp_list,     send_len);
+        apply_tweak(ir1->challenge, tweaked_chal);
+        memcpy(hmac_input,              tweaked_chal, NONCE_SIZE);
+        memcpy(hmac_input + NONCE_SIZE, &resp_list,   send_len);
+        secure_zero(tweaked_chal, NONCE_SIZE);
 
         memset(&ir2, 0, sizeof(ir2));
         if (hmac_sha256(TRANSFER_AUTH_KEY,
