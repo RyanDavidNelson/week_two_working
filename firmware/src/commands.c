@@ -2,73 +2,6 @@
  * @file commands.c
  * @brief eCTF command handlers
  * @date 2026
- *
- * Module 5: Full mutual-authentication transfer protocol.
- *
- * SRAM strategy (MSPM0L2228 = 32 KB total):
- *
- *   .bss layout:
- *     uart_buf   8251 B  (HSM.c static — MAX_MSG_SIZE)
- *     s_work     8273 B  (this file — shared work union, see below)
- *     FAT         192 B  (filesystem.c — 8 x 24-byte entries)
- *     misc        ~300 B
- *     Total      ~17.0 KB
- *   Available stack: 32768 - 17000 ≈ 15.8 KB
- *
- *   Stack peaks measured per call path (all < 15.8 KB available):
- *     list  → generate_list_files        8277 B  file_t temp_file
- *     write → secure_write_file          8300 B
- *     read  → secure_read_file           8300 B  (s_work.rsp used, not stack)
- *     receive → secure_write_file        8400 B  (s_work.rcv used, not stack)
- *     listen / RECEIVE_MSG               8700 B  union u (file_t / r4 shared)
- *     listen / INTERROGATE_MSG           1000 B  file_header_t hdr + resp_list + hmac_input
- *
- *   s_work union: members share 8273 bytes of static .bss.
- *   All commands are sequential on bare metal; members never overlap in use.
- *
- *   RECEIVE FIX: receive_r4_t was formerly 8273 B on the stack of receive().
- *   When receive() called secure_write_file() (file_t = 8277 B), combined
- *   stack reached ~17.25 KB — overflow.  Fix: receive into s_work.rcv (static).
- *
- * Key usage:
- *   STORAGE_KEY       — at-rest AES-GCM (via secure_{read,write}_file)
- *   TRANSFER_KEY      — in-transit AES-GCM (receive R4, listen R4 tx)
- *   TRANSFER_AUTH_KEY — HMAC handshake challenge-response
- *   PERM_MAC_KEY      — HMAC for PERMISSION_MAC verification only
- *   CHALLENGE_TWEAK   — nonce XOR mask applied before every HMAC call
- *   PIN_KEY           — PIN verification via SECURE_PIN_CHECK
- *
- * FIX FI1 (HIGH): Every `if (!ok1)` that follows a SECURE_PIN_CHECK or
- *   SECURE_BOOL_CHECK has been changed to `if (!(ok1 & ok2))`.
- *
- * FIX SCA3 (HIGH): PERM_MAC_KEY is architecturally split from TRANSFER_AUTH_KEY.
- *   verify_perm_mac() now uses PERM_MAC_KEY.  PERM_MAC_KEY never enters any
- *   runtime HMAC hardware call — it exists only as a flash constant.  CPA
- *   on handshake traces recovers TRANSFER_AUTH_KEY but not PERM_MAC_KEY.
- *
- * FIX SCA4 (HIGH): CHALLENGE_TWEAK is XOR'd with every handshake/interrogate
- *   nonce before it enters hmac_sha256().  Both sides of an exchange apply the
- *   same deployment-wide tweak, so authentication is unaffected.  An attacker
- *   who sends chosen nonces cannot predict the actual HMAC input at trace
- *   collection time, breaking the chosen-input advantage required for CPA.
- *
- * FIX P1 (HIGH): In listen()/RECEIVE_MSG, recv_auth (TRANSFER_AUTH_KEY HMAC)
- *   is now verified BEFORE verify_perm_mac() is called.  Previously an
- *   unauthenticated sender could reach verify_perm_mac() with arbitrary
- *   perms[], enabling chosen-input CPA on PERM_MAC_KEY without needing
- *   TRANSFER_AUTH_KEY.  After this fix, PERM_MAC_KEY is only exercised
- *   after the sender has proven knowledge of TRANSFER_AUTH_KEY.
- *
- * FIX P2 (MEDIUM): perm_bytes_has_receive() in listen()/RECEIVE_MSG is now
- *   wrapped in SECURE_BOOL_CHECK.  Previously the single branch was a
- *   predictable glitch target at a known timing window after R3 arrives.
- *
- * FIX P3 (LOW): interrogate() bounds-checks r2.list.n_files against
- *   list_data_len before forwarding to the host.
- *
- * FIX #3: write() validates name AFTER the PIN check.
- * FIX #5: All print_debug() calls removed from production build.
- *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 
@@ -122,7 +55,6 @@ static void serialize_one_perm(const group_permission_t *p, uint8_t *out)
 
 /*
  * Serialize count entries from src[] into out[].
- * Loop counter i in [0, count); terminates when i == count.
  */
 static void serialize_permissions(const group_permission_t *src,
                                   uint8_t count, uint8_t *out)
@@ -136,7 +68,6 @@ static void serialize_permissions(const group_permission_t *src,
 /*
  * Validate boolean fields in received serialized permissions.
  * p[2]=read, p[3]=write, p[4]=receive must each be exactly 0 or 1.
- * Loop counter i in [0, perm_count); terminates when i == perm_count.
  */
 static bool validate_perm_bytes(const uint8_t *perms, uint8_t perm_count)
 {
@@ -152,7 +83,6 @@ static bool validate_perm_bytes(const uint8_t *perms, uint8_t perm_count)
 
 /*
  * Check if serialized permissions grant RECEIVE for a given group_id.
- * Loop counter i in [0, perm_count); terminates when i == perm_count.
  */
 static bool perm_bytes_has_receive(const uint8_t *perms, uint8_t perm_count,
                                    uint16_t group_id)
@@ -169,8 +99,6 @@ static bool perm_bytes_has_receive(const uint8_t *perms, uint8_t perm_count,
 /*
  * Verify the PERMISSION_MAC attached to a received permission blob.
  * PERMISSION_MAC = HMAC(PERM_MAC_KEY, count || perms || "permission").
- *
- * FIX SCA3: uses PERM_MAC_KEY, not TRANSFER_AUTH_KEY.  PERM_MAC_KEY never
  * enters any runtime HMAC hardware call — it only exists as a flash constant.
  * CPA on handshake traces cannot recover it.
  */
@@ -187,8 +115,6 @@ static bool verify_perm_mac(uint8_t perm_count, const uint8_t *perms,
 
 /*
  * XOR nonce with CHALLENGE_TWEAK into tweaked[NONCE_SIZE].
- *
- * FIX SCA4: breaks the chosen-input advantage required for CPA.  The attacker
  * controls the nonce bytes on the wire but cannot predict the actual HMAC
  * first-block input without knowing CHALLENGE_TWEAK (a deployment secret).
  * Both sides of an exchange apply the same tweak so authentication is
@@ -196,8 +122,6 @@ static bool verify_perm_mac(uint8_t perm_count, const uint8_t *perms,
  *
  * Call apply_tweak(), pass tweaked to hmac_sha256/hmac_verify, then
  * secure_zero(tweaked, NONCE_SIZE) after the call.
- *
- * Loop counter i in [0, NONCE_SIZE); terminates when i == NONCE_SIZE.
  */
 static void apply_tweak(const uint8_t *nonce, uint8_t *tweaked)
 {
@@ -210,8 +134,6 @@ static void apply_tweak(const uint8_t *nonce, uint8_t *tweaked)
 
 /*
  * generate_list_files — read all flash slots and populate file_list.
- * Loop counter slot in [0, MAX_FILE_COUNT); terminates when slot == MAX_FILE_COUNT.
- *
  * NOTE: reads the full file_t once per slot — does NOT call is_slot_in_use()
  * separately because that would put a second 8277-byte file_t on the stack
  * while temp_file is still live, overflowing the stack budget.
@@ -265,7 +187,7 @@ int list(uint16_t pkt_len, uint8_t *buf)
 
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-    if (!(ok1 & ok2)) {   /* FI1 fix */
+    if (!(ok1 & ok2)) {
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
@@ -305,7 +227,7 @@ int read(uint16_t pkt_len, uint8_t *buf)
 
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-    if (!(ok1 & ok2)) {   /* FI1 fix */
+    if (!(ok1 & ok2)) {
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
@@ -318,7 +240,7 @@ int read(uint16_t pkt_len, uint8_t *buf)
     }
 
     SECURE_BOOL_CHECK(ok1, ok2, validate_permission(pre_gid, PERM_READ));
-    if (!(ok1 & ok2)) {   /* FI1 fix */
+    if (!(ok1 & ok2)) {
         print_error("Operation failed");
         return -1;
     }
@@ -361,8 +283,6 @@ int read(uint16_t pkt_len, uint8_t *buf)
 
 /*
  * WRITE — permission enforced; overwrites existing slot content if occupied.
- *
- * FIX #3: validate_name() is called AFTER the PIN check.
  *   Structural guards (slot, contents_len, packet length) remain before
  *   the PIN because they reject malformed packets regardless of credentials.
  *   Moving validate_name() after the PIN eliminates the pre-auth oracle.
@@ -393,7 +313,7 @@ int write(uint16_t pkt_len, uint8_t *buf)
     /* Step 2: authenticate before inspecting any business-logic fields. */
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-    if (!(ok1 & ok2)) {   /* FI1 fix */
+    if (!(ok1 & ok2)) {
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
@@ -406,7 +326,7 @@ int write(uint16_t pkt_len, uint8_t *buf)
     }
 
     SECURE_BOOL_CHECK(ok1, ok2, validate_permission(command->group_id, PERM_WRITE));
-    if (!(ok1 & ok2)) {   /* FI1 fix */
+    if (!(ok1 & ok2)) {
         print_error("Operation failed");
         return -1;
     }
@@ -475,7 +395,7 @@ int receive(uint16_t pkt_len, uint8_t *buf)
 
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-    if (!(ok1 & ok2)) {   /* FI1 fix */
+    if (!(ok1 & ok2)) {
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
@@ -626,7 +546,7 @@ int receive(uint16_t pkt_len, uint8_t *buf)
      * on failure, and the FI1 fix below hardens the branch.
      */
     SECURE_BOOL_CHECK(ok1, ok2, validate_permission(saved_group_id, PERM_RECEIVE));
-    if (!(ok1 & ok2)) {   /* FI1 fix */
+    if (!(ok1 & ok2)) {
         secure_zero(&s_work.rcv, sizeof(s_work.rcv));
         secure_zero(saved_uuid,  UUID_SIZE);
         secure_zero(saved_name,  MAX_NAME_SIZE);
@@ -683,7 +603,7 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
 
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-    if (!(ok1 & ok2)) {   /* FI1 fix */
+    if (!(ok1 & ok2)) {
         delay_ms(4500);
         print_error("Operation failed");
         return -1;
@@ -750,8 +670,6 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
     secure_zero(&r1, sizeof(r1));
 
     /*
-     * FIX P3: bounds-check n_files before forwarding list to host.
-     *
      * A crafted n_files value larger than what list_data_len can hold would
      * cause the host-side parser to read past the actual data.  Enforce that
      * the serialized list size implied by n_files fits within list_data_len.
@@ -784,9 +702,6 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
  *
  * No PIN check; LISTEN accepts exactly one command from TRANSFER_INTERFACE.
  *
- * PHASE 1A FIX: write_packet(CONTROL_INTERFACE, LISTEN_MSG, ...) is sent at
- * the very top of this function, BEFORE blocking on TRANSFER_INTERFACE.
- *
  * STALE DRAIN: drain any bytes left in the UART1 FIFO from a prior aborted
  * exchange before blocking on the peer's R1.  uart_drain_rx() is non-blocking.
  *
@@ -798,17 +713,6 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
  * INTERROGATE_MSG stack peak:
  *   file_header_t hdr(55) + ir2(316) + resp_list(284) + hmac_input(296) ≈ 1 KB.
  *
- * DESYNC FIX: every error path that fires AFTER R2 was sent sends a
- * best-effort ERROR_MSG on TRANSFER_INTERFACE before returning.
- *
- * FIX SCA4: CHALLENGE_TWEAK applied to all nonce-based HMAC calls.
- *
- * FIX P1: recv_auth (TRANSFER_AUTH_KEY) is verified BEFORE verify_perm_mac()
- *   in the R3 block.  This prevents an unauthenticated sender from reaching
- *   PERM_MAC_KEY operations with chosen perms[] input.
- *
- * FIX P2: perm_bytes_has_receive() is wrapped in SECURE_BOOL_CHECK so a
- *   single voltage glitch cannot skip the receiver permission check.
  */
 int listen(uint16_t pkt_len, uint8_t *buf)
 {
@@ -959,7 +863,6 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         }
 
         /*
-         * FIX P1: verify recv_auth (TRANSFER_AUTH_KEY) BEFORE calling
          * verify_perm_mac() (PERM_MAC_KEY).  An unauthenticated sender who
          * reaches verify_perm_mac() with arbitrary perms[] can mount a
          * chosen-input CPA on PERM_MAC_KEY without needing TRANSFER_AUTH_KEY.
@@ -994,14 +897,13 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         }
 
         /*
-         * FIX P2: wrap perm_bytes_has_receive() in SECURE_BOOL_CHECK.
          * Previously a single voltage glitch at the predictable window
          * immediately after R3 arrives could skip this branch entirely,
          * allowing an unauthorized receiver to obtain the file.
          */
         SECURE_BOOL_CHECK(ok1, ok2,
             perm_bytes_has_receive(r3.perms, r3.perm_count, saved_group_id));
-        if (!(ok1 & ok2)) {   /* FI1 fix */
+        if (!(ok1 & ok2)) {
             secure_zero(recv_chal, NONCE_SIZE);
             secure_zero(send_chal, NONCE_SIZE);
             secure_zero(&r3, sizeof(r3));
@@ -1099,7 +1001,6 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         /*
          * Build filtered file list.
          * Uses file_header_t hdr (55 B) per slot, NOT file_t (8277 B).
-         * Loop counter slot in [0, MAX_FILE_COUNT); terminates at MAX_FILE_COT.
          */
         memset(&resp_list, 0, sizeof(resp_list));
         for (slot = 0U; slot < MAX_FILE_COUNT; slot++) {

@@ -7,16 +7,12 @@
  * CTF (eCTF). This code is being provided only for educational purposes for
  * the 2026 MITRE eCTF competition, and may not meet MITRE standards for
  * quality. Use this code at your own risk!
- *
- * FIX SCA1 (MEDIUM): random_delay() is now called inside check_pin_cmp()
  *   immediately before hmac_sha256(PIN_KEY, ...).  The TRNG-sourced jitter
  *   desynchronises power traces collected across multiple PIN attempts,
  *   raising the trace count required for a CPA attack on the SHA-256
  *   compression of (PIN_KEY ^ ipad) from O(hundreds) toward O(tens-of-thousands).
  *   SECURE_PIN_CHECK calls check_pin_cmp() twice per attempt, so each
  *   attempt produces two independently jittered traces — further raising cost.
- *
- * FIX SCA5 (LOW): random_delay() now reads TWO TRNG bytes instead of one,
  *   producing 32768 discrete delay steps instead of 128.  The jitter range
  *   stays at 0–~5 ms (coarse byte: 0–~4 ms, fine byte: 0–~1 ms extra),
  *   but the number of distinct delay values increases by 256×.  This raises
@@ -72,8 +68,6 @@ void delay_ms(uint32_t ms)
 void random_delay(void)
 {
     /*
-     * FIX SCA5: read TWO TRNG bytes for 32768 discrete delay steps.
-     *
      * Encoding:
      *   b0 (high byte): coarse delay — 0–127 steps of 1000 cycles (~0–4 ms)
      *   b1 (low byte):  fine delay   — 0–255 steps of 125 cycles  (~0–1 ms)
@@ -162,7 +156,6 @@ int trng_init(void)
     DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
 
     /* Poll until the clock divider register confirms normal-function mode.
-     * Loop counter poll_i in [0, TRNG_POLL_LIMIT). */
     for (poll_i = 0;
          DL_TRNG_getClockDivider(TRNG) != DL_TRNG_CLOCK_DIVIDE_2 &&
          poll_i < TRNG_POLL_LIMIT;
@@ -182,7 +175,6 @@ uint32_t trng_read_word(void)
     DL_TRNG_sendCommand(TRNG, DL_TRNG_CMD_NORM_FUNC);
 
     /* Poll until capture-ready flag is set.
-     * Loop counter poll_i in [0, TRNG_POLL_LIMIT). */
     for (poll_i = 0;
          !DL_TRNG_isCaptureReady(TRNG) && poll_i < TRNG_POLL_LIMIT;
          poll_i++) {}
@@ -211,7 +203,6 @@ bool secure_compare(const void *a, const void *b, size_t len)
     size_t         i;
 
     /* XOR accumulator: acc == 0 iff all bytes equal.
-     * Loop counter i in [0, len); constant-time for all inputs. */
     for (i = 0; i < len; i++) {
         acc |= pa[i] ^ pb[i];
     }
@@ -221,8 +212,6 @@ bool secure_compare(const void *a, const void *b, size_t len)
 
 /*
  * check_pin_cmp — single-pass HMAC-based PIN check, no brute-force penalty.
- *
- * FIX SCA1: random_delay() called immediately before hmac_sha256(PIN_KEY, ...)
  * to desynchronise power traces at the SHA-256 inner compression block
  * (PIN_KEY ^ ipad).  SECURE_PIN_CHECK invokes this function twice per attempt,
  * so each attempt produces two independently jittered traces.
@@ -281,9 +270,6 @@ bool check_pin(unsigned char *pin)
 
 /*
  * validate_permission — double-pass local permission check.
- *
- * Loop counter i in [0, PERM_COUNT); terminates when i == PERM_COUNT.
- * Loop counter j in [0, PERM_COUNT); terminates when j == PERM_COUNT.
  */
 bool validate_permission(uint16_t group_id, permission_enum_t perm)
 {

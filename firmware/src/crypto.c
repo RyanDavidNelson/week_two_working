@@ -12,63 +12,6 @@
  *   Key is loaded once per call; peripheral is reset after to clear
  *   key registers — limits hardware register exposure window.
  *
- * IV layout for a 96-bit nonce (standard GCM J0):
- *   iv[0..11]  = nonce (copied from caller)
- *   iv[12..14] = 0x00
- *   iv[15]     = 0x01  <- counter = 1 (big-endian byte order)
- *   The ARM reads iv[12..15] as a little-endian uint32, giving IV3 = 0x01000000.
- *
- * Data path (CPU polling, DMA disabled):
- *   For each 16-byte block, poll isInputReady() then write 4 words.
- *   AAD blocks: no output read.
- *   Crypto blocks: after writing, poll isOutputReady() then read 4 words.
- *   Partial last block: zero-padded on input; only valid bytes copied from output.
- *   After all data: poll isSavedOutputContextReady(), read 16-byte TAG.
- *
- * FIX FI2 (MEDIUM): aes_gcm_decrypt() stores the aesadv_gcm_run() return
- *   value in a volatile int (hw_ret) and checks it TWICE with independent
- *   volatile reads.  A single voltage glitch that skips the first branch
- *   cannot simultaneously skip the second read; any non-zero residual value
- *   is caught before tag comparison begins.  Plaintext is zeroed on all
- *   failure paths — no partial plaintext leaks.
- *
- *   The tag comparison itself uses double-evaluated secure_compare() that
- *   mirrors hmac_verify()'s fault hardening: both evaluations must agree or
- *   security_halt() fires.
- *
- * FIX FI3 (MEDIUM): The final tag accept/reject branch in aes_gcm_decrypt()
- *   now uses `if (!(tag_ok1 & tag_ok2))` instead of `if (!tag_ok1)`, and
- *   tag_ok1/tag_ok2 are declared volatile.  By the time this branch is
- *   reached, the agreement check has already confirmed tag_ok1 == tag_ok2
- *   (security_halt fires on disagreement), so the logical result is identical.
- *   Using the bitwise AND of both volatile booleans means a glitch that
- *   corrupts one boolean in a register cannot silently pass a failed tag —
- *   the attacker would have to simultaneously corrupt both independent reads.
- *
- * FIX SCA2 (MEDIUM): random_delay() is now called inside hmac_sha256()
- *   immediately before wc_HmacSetKey().  wc_HmacSetKey() is where wolfcrypt
- *   computes key XOR ipad and feeds it into the first SHA-256 compression —
- *   the exact operation targeted by CPA.  Placing jitter here desynchronises
- *   every HMAC callsite automatically: PIN verification, handshake
- *   sender_auth / recv_auth, interrogate auth, and PERMISSION_MAC generation
- *   all benefit without any changes to commands.c or security.c.
- *
- *   Prior state: random_delay() covered AES key loads (both encrypt and
- *   decrypt) and PIN HMAC (via check_pin_cmp).  The handshake and
- *   interrogate HMAC calls in commands.c had no jitter, leaving
- *   TRANSFER_AUTH_KEY exposed to CPA against chosen-challenge inputs on the
- *   LISTEN interface.
- *
- *   hmac_verify() already calls hmac_sha256() twice with a random_delay()
- *   between passes; each inner call now adds a second independent jitter
- *   before the key schedule.  This further raises the trace count required
- *   for a successful CPA attack.
- *
- * SCA: random_delay() before key load in both encrypt and decrypt.
- *
- * Include order: wolfssl headers first so settings.h resolves CFLAGS defines
- * before hmac.h applies its conditional guards.
- *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 
@@ -114,7 +57,6 @@ static void aesadv_reset_and_enable(void)
 
 /* -----------------------------------------------------------------------
  * poll_input_ready — wait until AESADV input buffer is empty.
- * Loop counter poll_i in [0, AESADV_POLL_LIMIT); halts on timeout.
  * ---------------------------------------------------------------------- */
 static void poll_input_ready(void)
 {
@@ -129,7 +71,6 @@ static void poll_input_ready(void)
 
 /* -----------------------------------------------------------------------
  * poll_output_ready — wait until AESADV output block is available.
- * Loop counter poll_i in [0, AESADV_POLL_LIMIT); halts on timeout.
  * ---------------------------------------------------------------------- */
 static void poll_output_ready(void)
 {
@@ -144,7 +85,6 @@ static void poll_output_ready(void)
 
 /* -----------------------------------------------------------------------
  * poll_tag_ready — wait until saved output context (TAG) is available.
- * Loop counter poll_i in [0, AESADV_POLL_LIMIT); halts on timeout.
  * ---------------------------------------------------------------------- */
 static void poll_tag_ready(void)
 {
@@ -161,7 +101,6 @@ static void poll_tag_ready(void)
 /* -----------------------------------------------------------------------
  * feed_aad_blocks — push all AAD to AESADV; no output is produced.
  * Last block is zero-padded.
- * Loop counter blk_i in [0, num_blks); terminates exactly at num_blks.
  * ---------------------------------------------------------------------- */
 static void feed_aad_blocks(const uint8_t *aad, size_t aad_len)
 {
@@ -194,7 +133,6 @@ static void feed_aad_blocks(const uint8_t *aad, size_t aad_len)
 /* -----------------------------------------------------------------------
  * feed_crypto_blocks — push plaintext/ciphertext, collect output.
  * Partial last block zero-padded; only valid bytes copied from output.
- * Loop counter blk_i in [0, num_blks); terminates exactly at num_blks.
  * ---------------------------------------------------------------------- */
 static void feed_crypto_blocks(const uint8_t *input, uint8_t *output,
                                 size_t data_len)
@@ -306,7 +244,6 @@ int crypto_init(void)
 
 /* -----------------------------------------------------------------------
  * generate_nonce — fill nonce_out with NONCE_SIZE TRNG bytes.
- * Loop counter i in [0, NONCE_SIZE); terminates at NONCE_SIZE exactly.
  * ---------------------------------------------------------------------- */
 int generate_nonce(uint8_t *nonce_out)
 {
@@ -351,26 +288,6 @@ int aes_gcm_encrypt(const uint8_t *key,
 
 /* -----------------------------------------------------------------------
  * aes_gcm_decrypt — AES-256-GCM decryption via AESADV hardware.
- *
- * FIX FI2 (MEDIUM): hw_ret is declared volatile so the compiler cannot
- *   merge or eliminate either of the two independent branch reads.
- *
- *   Attack scenario without fix:
- *     A single voltage glitch targeting the conditional branch instruction
- *     after aesadv_gcm_run() causes the CPU to predict/skip the branch,
- *     proceeding directly to tag comparison with a stale or corrupt hw_ret.
- *     If the glitch also corrupts the tag registers or the comparison
- *     result, plaintext may escape.
- *
- *   With fix:
- *     The first `if (hw_ret != 0)` is one branch instruction.  A glitch
- *     that skips it leaves the CPU executing the second `if (hw_ret != 0)`
- *     on the very next cycle — two physically distinct branch sites that
- *     cannot both be skipped by a single glitch pulse.  If hw_ret is still
- *     non-zero after the first skip, the second check fires and returns -1.
- *
- *   FIX FI3 (MEDIUM): tag_ok1 and tag_ok2 are volatile; final branch uses
- *   `if (!(tag_ok1 & tag_ok2))`.  See file-level comment for rationale.
  *
  *   Plaintext zeroed on every failure path — no partial plaintext leaks.
  * ---------------------------------------------------------------------- */
@@ -437,7 +354,6 @@ int aes_gcm_decrypt(const uint8_t *key,
     /*
      * FI3: bitwise AND of both volatile booleans.  The agreement check above
      * guarantees tag_ok1 == tag_ok2 here, so the logical result is unchanged.
-     * A glitch corrupting one boolean after the agreement check still cannot
      * silently accept a bad tag — both must be true for the AND to be true.
      */
     if (!(tag_ok1 & tag_ok2)) {
@@ -456,8 +372,6 @@ int aes_gcm_decrypt(const uint8_t *key,
  *
  * Computes HMAC(key, data || domain) via two wc_HmacUpdate calls so no
  * temporary concatenation buffer is needed on the stack.
- *
- * FIX SCA2 (MEDIUM): random_delay() is called immediately before
  *   wc_HmacSetKey().  wc_HmacSetKey() is the first key-dependent operation:
  *   it XORs the key with ipad and feeds the result into the SHA-256
  *   compression function.  This is the leakage point targeted by CPA.

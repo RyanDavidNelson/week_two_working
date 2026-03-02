@@ -42,8 +42,6 @@ int uart_readbyte(int uart_id) {
  *
  *  Polls DL_UART_isRXFIFOEmpty in a counted loop so the caller cannot hang
  *  forever if the peer stalls or the wire is disconnected.
- *
- *  Loop counter waited in [0, UART_TRANSFER_TIMEOUT_CYCLES);
  *  terminates when a byte arrives or the limit is reached.
  *
  *  @param uart_id   The index of UART to use.
@@ -76,8 +74,6 @@ void uart_writebyte(int uart_id, uint8_t data) {
  *
  *  Reads and discards up to max_bytes bytes that are immediately available.
  *  Returns as soon as the FIFO is empty without waiting for new data.
- *  Loop counter drain_i in [0, max_bytes); terminates on empty FIFO.
- *
  *  @param uart_id   UART to drain.
  *  @param max_bytes Upper bound on bytes to discard.
  *  @return Number of bytes discarded.
@@ -87,7 +83,6 @@ uint8_t uart_drain_rx(int uart_id, uint8_t max_bytes) {
     uint8_t    drain_i;
 
     /* Discard bytes present in FIFO right now; do NOT wait for new ones.
-     * Loop counter drain_i in [0, max_bytes); terminates when FIFO is empty. */
     for (drain_i = 0; drain_i < max_bytes; drain_i++) {
         if (DL_UART_isRXFIFOEmpty(uart)) {
             break; /* nothing left */

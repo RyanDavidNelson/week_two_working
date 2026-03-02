@@ -61,8 +61,6 @@ int uart_readbyte(int uart_id);
  *  forever when the peer stalls or the wire is disconnected.
  *  Only intended for TRANSFER_INTERFACE; CONTROL_INTERFACE should use
  *  uart_readbyte() which blocks until the host delivers data.
- *
- *  Loop counter waited in [0, UART_TRANSFER_TIMEOUT_CYCLES);
  *  terminates when a byte arrives or the limit is reached.
  *
  *  @param uart_id   The index of UART to use.
@@ -82,8 +80,6 @@ void uart_writebyte(int uart_id, uint8_t data);
  *
  *  Reads and discards up to max_bytes bytes that are immediately available.
  *  Returns as soon as the FIFO is empty without waiting for new data.
- *  Loop counter drain_i in [0, max_bytes); terminates on empty FIFO.
- *
  *  @param uart_id   UART to drain.
  *  @param max_bytes Upper bound on bytes to discard.
  *  @return Number of bytes discarded.

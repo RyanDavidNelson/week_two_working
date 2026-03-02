@@ -3,14 +3,6 @@
  * @brief eCTF command handlers and protocol message structures
  * @date 2026
  *
- * Module 5: Full authenticated 4-round transfer protocol.
- *   RECEIVE:     4-round mutual-auth handshake + GCM-encrypted file transfer.
- *   INTERROGATE: Challenge-response + permission-filtered file list.
- *   LISTEN:      Responder side for both RECEIVE and INTERROGATE.
- *
- * Wire formats use #pragma pack(1); no compiler-inserted padding.
- * Permission bytes on the wire: group_id(2 LE) || read(1) || write(1) || receive(1).
- *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 

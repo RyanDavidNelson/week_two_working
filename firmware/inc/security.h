@@ -91,44 +91,6 @@ typedef struct {
 /*
  * SECURE_CHECK_FAILED — test the result of a preceding SECURE_BOOL_CHECK or
  * SECURE_PIN_CHECK with complement-canary hardening.
- *
- * WHY THE PLAIN `if (!(ok1 & ok2))` IS INSUFFICIENT:
- *   After the macro runs, both ok1 and ok2 hold the correct value and agree.
- *   The subsequent branch `if (!(ok1 & ok2))` compiles to a single CMP+BEQ
- *   instruction on Cortex-M0+.  A ChipWhisperer voltage glitch targeting that
- *   instruction can skip or mis-execute the branch, bypassing the entire check
- *   without the macro ever detecting anything.
- *
- * HOW THIS MACRO HARDENS THE BRANCH:
- *   1. Re-read ok1 and ok2 from their stack slots into fresh volatiles
- *      (_v1, _v2) — forces two independent loads the compiler cannot merge.
- *   2. Compute _and = _v1 & _v2 — the expected "pass" value.
- *   3. Store _canary = !(_and) — the expected "fail" value.
- *   4. The final expression is true (i.e. "check failed") only when both
- *      _and is false AND _canary is true — they must be complementary.
- *
- * SINGLE-GLITCH ANALYSIS:
- *   - Glitch flips _v1's load (false→true): _and=true, _canary=false → !(_and
- *     & !_canary) = !(true & true) = false → guard active (check "passed").
- *     Wait — that would incorrectly say "not failed".  Let me re-examine.
- *
- *   The expression returned is: !(_and & !_canary).
- *     Normal pass  (ok1=ok2=true):  _and=true,  _canary=false → !(true & true)  = false → not failed ✓
- *     Normal fail  (ok1=ok2=false): _and=false, _canary=true  → !(false & false) = true  → failed ✓
- *     Glitch _v1 load (false→true, _v2=false): _and=false, _canary=true → !(false & false) = true → failed ✓
- *     Glitch _and (false→true): _canary=true (computed before glitch) → !(true & false) = true → failed ✓
- *     Glitch _canary (true→false): _and=false → !(false & true) = true → failed ✓
- *     Glitch the branch itself: still reads three separate volatile-derived
- *       values; attacker would need to simultaneously corrupt _and AND _canary
- *       AND the branch — three independent fault targets.
- *
- * Usage pattern:
- *   volatile bool ok1, ok2;
- *   SECURE_BOOL_CHECK(ok1, ok2, some_condition);
- *   if (SECURE_CHECK_FAILED(ok1, ok2)) {
- *       // reject path
- *   }
- *   // accept path
  */
 #define SECURE_CHECK_FAILED(ok1, ok2)                   \
     __extension__({                                      \
@@ -175,21 +137,6 @@ void security_halt(void) __attribute__((noreturn));
 
 /*
  * __stack_chk_guard — runtime stack canary, seeded from TRNG in init().
- *
- * The compiler (-fstack-protector-strong) reads this at instrumented
- * function entry, stores a copy just above the return address, then
- * re-reads and compares at function exit.  Any linear stack smash that
- * reaches the return address must first corrupt the stored copy.
- *
- * Layout on little-endian Cortex-M0+:
- *   byte 0 (lowest address, overwritten first by upward smash) == 0x00
- *   bytes 1-3 == random TRNG bytes
- *
- * The embedded null (byte 0) means any string-copy overwrite that would
- * produce a non-zero value at that position corrupts the canary before
- * reaching the return address.  The 24 random bits in bytes 1-3 defeat
- * non-string overwrites.
- *
  * Declared volatile so the compiler cannot cache the load in a register.
  */
 extern volatile uint32_t __stack_chk_guard;

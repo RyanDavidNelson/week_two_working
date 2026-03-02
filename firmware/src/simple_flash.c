@@ -53,7 +53,6 @@ int flash_simple_erase_page(uint32_t address) {
  *
  * Erases num_pages contiguous flash pages starting at address.
  * Symmetric counterpart to flash_simple_write() for multi-page operations.
- * Loop counter page_i in [0, num_pages); terminates when page_i == num_pages.
 */
 int flash_simple_erase_pages(uint32_t address, uint8_t num_pages) {
     uint8_t page_i; /* loop counter — terminates at num_pages */
@@ -128,7 +127,6 @@ int flash_simple_write(uint32_t address, void* buffer, uint32_t size) {
     DL_FlashCTL_executeClearStatus(FLASHCTL);
 
     /* Write one flash page at a time.
-     * Loop counter offset in [0, size); terminates when offset >= size. */
     for (offset = 0; offset < size; offset += FLASH_PAGE_SIZE) {
 
         /* Bytes remaining vs. one full page. */

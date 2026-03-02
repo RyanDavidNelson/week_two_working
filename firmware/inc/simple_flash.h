@@ -48,7 +48,6 @@ int flash_simple_erase_page(uint32_t address);
  *
  * Erases num_pages contiguous flash pages starting at address.
  * Symmetric counterpart to flash_simple_write() for multi-page operations.
- * Loop counter page_i in [0, num_pages); terminates when page_i == num_pages.
 */
 int flash_simple_erase_pages(uint32_t address, uint8_t num_pages);
 

@@ -81,8 +81,6 @@ int main(void)
         STATUS_LED_ON();
 
         /*
-         * FIX #1: initialise pkt_len to MAX_MSG_SIZE, not 0.
-         *
          * read_packet() only enforces the overflow guard when *len != 0:
          *   if (*len != 0 && header.len > *len) { return MSG_BAD_LEN; }
          * Passing 0 disabled the check, allowing an attacker to send a
