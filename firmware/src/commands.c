@@ -52,7 +52,18 @@
  *   who sends chosen nonces cannot predict the actual HMAC input at trace
  *   collection time, breaking the chosen-input advantage required for CPA.
  *
- * FIX P2 (LOW): interrogate() bounds-checks r2.list.n_files against
+ * FIX P1 (HIGH): In listen()/RECEIVE_MSG, recv_auth (TRANSFER_AUTH_KEY HMAC)
+ *   is now verified BEFORE verify_perm_mac() is called.  Previously an
+ *   unauthenticated sender could reach verify_perm_mac() with arbitrary
+ *   perms[], enabling chosen-input CPA on PERM_MAC_KEY without needing
+ *   TRANSFER_AUTH_KEY.  After this fix, PERM_MAC_KEY is only exercised
+ *   after the sender has proven knowledge of TRANSFER_AUTH_KEY.
+ *
+ * FIX P2 (MEDIUM): perm_bytes_has_receive() in listen()/RECEIVE_MSG is now
+ *   wrapped in SECURE_BOOL_CHECK.  Previously the single branch was a
+ *   predictable glitch target at a known timing window after R3 arrives.
+ *
+ * FIX P3 (LOW): interrogate() bounds-checks r2.list.n_files against
  *   list_data_len before forwarding to the host.
  *
  * FIX #3: write() validates name AFTER the PIN check.
@@ -196,6 +207,7 @@ static void apply_tweak(const uint8_t *nonce, uint8_t *tweaked)
     }
 }
 
+
 /*
  * generate_list_files — read all flash slots and populate file_list.
  * Loop counter slot in [0, MAX_FILE_COUNT); terminates when slot == MAX_FILE_COUNT.
@@ -234,12 +246,17 @@ static void generate_list_files(list_response_t *file_list)
  ******************** COMMAND HANDLERS ********************
  **********************************************************/
 
-/* LIST — PIN checked BEFORE generating list to prevent filename leakage. */
+/*
+ * LIST — enumerate all occupied slots.
+ *
+ * generate_list_files() places a file_t (8277 B) on the stack.
+ * list() itself is thin, so combined stack stays under 15.8 KB.
+ */
 int list(uint16_t pkt_len, uint8_t *buf)
 {
-    list_command_t  *command = (list_command_t *)buf;
-    list_response_t  file_list;
-    volatile bool    ok1, ok2;
+    list_command_t *command = (list_command_t *)buf;
+    list_response_t file_list;
+    volatile bool   ok1, ok2;
 
     if (pkt_len < sizeof(list_command_t)) {
         print_error("Operation failed");
@@ -248,7 +265,6 @@ int list(uint16_t pkt_len, uint8_t *buf)
 
     SECURE_PIN_CHECK(ok1, ok2, command->pin);
     secure_zero(command->pin, PIN_LENGTH);
-
     if (!(ok1 & ok2)) {   /* FI1 fix */
         delay_ms(4500);
         print_error("Operation failed");
@@ -625,9 +641,12 @@ int receive(uint16_t pkt_len, uint8_t *buf)
      * secure_write_file() pushes file_t (8277 B) — total ~8400 B, well within
      * the 15.8 KB stack budget.
      */
-    ret = secure_write_file(command->write_slot, saved_group_id, saved_name,
-                            s_work.rcv.ciphertext,  /* plaintext after in-place decrypt */
-                            saved_contents_len, saved_uuid);
+    ret = secure_write_file(command->write_slot,
+                            saved_group_id,
+                            saved_name,
+                            s_work.rcv.ciphertext,   /* plaintext after in-place decrypt */
+                            saved_contents_len,
+                            saved_uuid);
 
     secure_zero(&s_work.rcv, sizeof(s_work.rcv));
     secure_zero(saved_uuid,  UUID_SIZE);
@@ -643,15 +662,7 @@ int receive(uint16_t pkt_len, uint8_t *buf)
 }
 
 /*
- * INTERROGATE — initiator side.
- *
- * R1 → send challenge XOR TWEAK auth + own permissions
- * R2 ← verify resp_auth; forward filtered list to host
- *
- * CHALLENGE_TWEAK is applied to the challenge nonce (FIX SCA4).
- *
- * FIX P2 (LOW): r2.list.n_files is bounds-checked against list_data_len
- * before the list is forwarded to the host.
+ * INTERROGATE — initiator side: authenticate, send R1, receive filtered list.
  */
 int interrogate(uint16_t pkt_len, uint8_t *buf)
 {
@@ -660,7 +671,8 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
     interrogate_r2_t       r2;
     volatile bool          ok1, ok2;
     msg_type_t             cmd;
-    uint16_t               r2_len, list_data_len;
+    uint16_t               r2_len;
+    uint16_t               list_data_len;
     uint8_t                hmac_input[NONCE_SIZE + sizeof(list_response_t)];
     uint8_t                tweaked_chal[NONCE_SIZE];   /* SCA4 */
 
@@ -738,7 +750,7 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
     secure_zero(&r1, sizeof(r1));
 
     /*
-     * FIX P2: bounds-check n_files before forwarding list to host.
+     * FIX P3: bounds-check n_files before forwarding list to host.
      *
      * A crafted n_files value larger than what list_data_len can hold would
      * cause the host-side parser to read past the actual data.  Enforce that
@@ -790,6 +802,13 @@ int interrogate(uint16_t pkt_len, uint8_t *buf)
  * best-effort ERROR_MSG on TRANSFER_INTERFACE before returning.
  *
  * FIX SCA4: CHALLENGE_TWEAK applied to all nonce-based HMAC calls.
+ *
+ * FIX P1: recv_auth (TRANSFER_AUTH_KEY) is verified BEFORE verify_perm_mac()
+ *   in the R3 block.  This prevents an unauthenticated sender from reaching
+ *   PERM_MAC_KEY operations with chosen perms[] input.
+ *
+ * FIX P2: perm_bytes_has_receive() is wrapped in SECURE_BOOL_CHECK so a
+ *   single voltage glitch cannot skip the receiver permission check.
  */
 int listen(uint16_t pkt_len, uint8_t *buf)
 {
@@ -814,13 +833,12 @@ int listen(uint16_t pkt_len, uint8_t *buf)
     /* RECEIVE_MSG — sender (responder) side                               */
     /* ================================================================== */
     if (cmd == RECEIVE_MSG) {
-        volatile bool ok1, ok2;   /* kept for future FI hardening */
+        volatile bool ok1, ok2;
 
-        /* Union: file_t and receive_r4_t share 8277 B of stack.
-         * Only one arm is live at a time. */
+        /* Union: file_t and receive_r4_t share 8277 B of stack. */
         union {
-            file_t       stored;
-            receive_r4_t fdata;
+            file_t       stored; /* 8277 B — used for STORAGE_KEY decrypt   */
+            receive_r4_t fdata;  /* 8273 B — used for TRANSFER_KEY encrypt  */
         } u;
 
         receive_r1_t *r1 = (receive_r1_t *)first_buf;
@@ -831,57 +849,59 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         uint8_t       recv_chal[NONCE_SIZE];
         uint8_t       send_chal[NONCE_SIZE];
         uint8_t       tweaked_chal[NONCE_SIZE];   /* SCA4 */
-        char          saved_name[MAX_NAME_SIZE];
-        uint16_t      saved_group_id;
-        uint16_t      saved_contents_len;
-        uint8_t       saved_uuid[UUID_SIZE];
-        uint8_t       slot_req;
         uint8_t       storage_aad[STORAGE_AAD_SIZE];
         uint8_t       transfer_aad[TRANSFER_AAD_SIZE];
         size_t        aad_len;
         int           ret;
 
-        (void)ok1; (void)ok2;   /* suppress unused-variable warnings */
+        /* Saved fields from R1 — needed after r1 (first_buf) is reused. */
+        uint8_t  saved_uuid[UUID_SIZE];
+        uint16_t saved_group_id;
+        uint16_t saved_contents_len;
+        char     saved_name[MAX_NAME_SIZE];
+        uint8_t  slot_req;
 
         if (first_len != sizeof(receive_r1_t)) { return -1; }
-        if (!validate_slot(r1->slot))          { return -1; }
 
         slot_req = r1->slot;
+        if (!validate_slot(slot_req)) { return -1; }
+
         memcpy(recv_chal, r1->recv_chal, NONCE_SIZE);
 
-        /* Load encrypted file from flash — check in_use inline.
-         * Do NOT call is_slot_in_use() here: second file_t on stack overflows. */
+        /* Read and decrypt stored file. */
         memset(&u.stored, 0, sizeof(u.stored));
-        if (read_file(slot_req, &u.stored) != 0 ||
-            u.stored.in_use != FILE_IN_USE ||
-            !validate_contents_len(u.stored.contents_len)) {
+        if (read_file(slot_req, &u.stored) != 0) {
+            secure_zero(recv_chal, NONCE_SIZE);
+            return -1;
+        }
+        if (u.stored.in_use != FILE_IN_USE) {
+            secure_zero(recv_chal, NONCE_SIZE);
+            secure_zero(&u.stored, sizeof(u.stored));
+            return -1;
+        }
+        if (!validate_contents_len(u.stored.contents_len)) {
+            secure_zero(recv_chal, NONCE_SIZE);
             secure_zero(&u.stored, sizeof(u.stored));
             return -1;
         }
 
-        /* Save metadata before u is repurposed for the fdata arm. */
-        saved_group_id     = u.stored.group_id;
+        /* Save header fields before u.stored is overwritten by re-use. */
         saved_contents_len = u.stored.contents_len;
+        saved_group_id     = u.stored.group_id;
+        memcpy(saved_uuid, u.stored.uuid, UUID_SIZE);
         memcpy(saved_name, u.stored.name, MAX_NAME_SIZE);
         saved_name[MAX_NAME_SIZE - 1] = '\0';
-        {
-            const filesystem_entry_t *fat = get_file_metadata(slot_req);
-            if (fat == NULL) {
-                secure_zero(&u.stored, sizeof(u.stored));
-                return -1;
-            }
-            memcpy(saved_uuid, fat->uuid, UUID_SIZE);
-        }
 
-        /* ---- R2: send sender challenge + authentication ---- */
+        /* ---- R2: build sender auth + send challenge ---- */
         memset(&r2, 0, sizeof(r2));
         if (generate_nonce(r2.send_chal) != 0) {
+            secure_zero(recv_chal, NONCE_SIZE);
             secure_zero(&u.stored, sizeof(u.stored));
             return -1;
         }
         memcpy(send_chal, r2.send_chal, NONCE_SIZE);
 
-        /* SCA4: sender_auth computed over tweaked recv_chal. */
+        /* SCA4: sender_auth over tweaked recv_chal. */
         apply_tweak(recv_chal, tweaked_chal);
         if (hmac_sha256(TRANSFER_AUTH_KEY, tweaked_chal, NONCE_SIZE,
                         HMAC_DOMAIN_SENDER, r2.sender_auth) != 0) {
@@ -937,16 +957,15 @@ int listen(uint16_t pkt_len, uint8_t *buf)
             (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
             return -1;
         }
-        if (!validate_perm_count(r3.perm_count) ||
-            !validate_perm_bytes(r3.perms, r3.perm_count) ||
-            !verify_perm_mac(r3.perm_count, r3.perms, r3.perm_mac)) {
-            secure_zero(recv_chal, NONCE_SIZE);
-            secure_zero(send_chal, NONCE_SIZE);
-            secure_zero(&r3, sizeof(r3));
-            secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
-            (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
-            return -1;
-        }
+
+        /*
+         * FIX P1: verify recv_auth (TRANSFER_AUTH_KEY) BEFORE calling
+         * verify_perm_mac() (PERM_MAC_KEY).  An unauthenticated sender who
+         * reaches verify_perm_mac() with arbitrary perms[] can mount a
+         * chosen-input CPA on PERM_MAC_KEY without needing TRANSFER_AUTH_KEY.
+         * After this reorder, PERM_MAC_KEY is only exercised once the sender
+         * has proven knowledge of TRANSFER_AUTH_KEY.
+         */
 
         /* SCA4: verify recv_auth over tweaked send_chal. */
         apply_tweak(send_chal, tweaked_chal);
@@ -962,8 +981,27 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         }
         secure_zero(tweaked_chal, NONCE_SIZE);
 
-        /* Receiver must have RECEIVE permission for this file's group. */
-        if (!perm_bytes_has_receive(r3.perms, r3.perm_count, saved_group_id)) {
+        /* Validate perm format and PERMISSION_MAC — only after auth passes. */
+        if (!validate_perm_count(r3.perm_count) ||
+            !validate_perm_bytes(r3.perms, r3.perm_count) ||
+            !verify_perm_mac(r3.perm_count, r3.perms, r3.perm_mac)) {
+            secure_zero(recv_chal, NONCE_SIZE);
+            secure_zero(send_chal, NONCE_SIZE);
+            secure_zero(&r3, sizeof(r3));
+            secure_zero(s_work.plain, MAX_CONTENTS_SIZE);
+            (void)write_packet(TRANSFER_INTERFACE, ERROR_MSG, NULL, 0);
+            return -1;
+        }
+
+        /*
+         * FIX P2: wrap perm_bytes_has_receive() in SECURE_BOOL_CHECK.
+         * Previously a single voltage glitch at the predictable window
+         * immediately after R3 arrives could skip this branch entirely,
+         * allowing an unauthorized receiver to obtain the file.
+         */
+        SECURE_BOOL_CHECK(ok1, ok2,
+            perm_bytes_has_receive(r3.perms, r3.perm_count, saved_group_id));
+        if (!(ok1 & ok2)) {   /* FI1 fix */
             secure_zero(recv_chal, NONCE_SIZE);
             secure_zero(send_chal, NONCE_SIZE);
             secure_zero(&r3, sizeof(r3));
@@ -1037,12 +1075,10 @@ int listen(uint16_t pkt_len, uint8_t *buf)
 
         if (first_len != sizeof(interrogate_r1_t)) { return -1; }
 
-        /* Validate requester permission MAC and auth. */
-        if (!validate_perm_count(ir1->perm_count) ||
-            !validate_perm_bytes(ir1->perms, ir1->perm_count) ||
-            !verify_perm_mac(ir1->perm_count, ir1->perms, ir1->perm_mac)) {
-            return -1;
-        }
+        /*
+         * Validate requester TRANSFER_AUTH_KEY first, then PERMISSION_MAC.
+         * Same ordering rationale as RECEIVE_MSG R3 fix (FIX P1).
+         */
 
         /* SCA4: verify interrogate_req auth over tweaked challenge. */
         apply_tweak(ir1->challenge, tweaked_chal);
@@ -1053,10 +1089,17 @@ int listen(uint16_t pkt_len, uint8_t *buf)
         }
         secure_zero(tweaked_chal, NONCE_SIZE);
 
+        /* Validate perm format and PERMISSION_MAC — only after auth passes. */
+        if (!validate_perm_count(ir1->perm_count) ||
+            !validate_perm_bytes(ir1->perms, ir1->perm_count) ||
+            !verify_perm_mac(ir1->perm_count, ir1->perms, ir1->perm_mac)) {
+            return -1;
+        }
+
         /*
          * Build filtered file list.
          * Uses file_header_t hdr (55 B) per slot, NOT file_t (8277 B).
-         * Loop counter slot in [0, MAX_FILE_COUNT); terminates at MAX_FILE_COUNT.
+         * Loop counter slot in [0, MAX_FILE_COUNT); terminates at MAX_FILE_COT.
          */
         memset(&resp_list, 0, sizeof(resp_list));
         for (slot = 0U; slot < MAX_FILE_COUNT; slot++) {

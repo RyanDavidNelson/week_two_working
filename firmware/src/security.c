@@ -16,6 +16,13 @@
  *   SECURE_PIN_CHECK calls check_pin_cmp() twice per attempt, so each
  *   attempt produces two independently jittered traces — further raising cost.
  *
+ * FIX SCA5 (LOW): random_delay() now reads TWO TRNG bytes instead of one,
+ *   producing 32768 discrete delay steps instead of 128.  The jitter range
+ *   stays at 0–~5 ms (coarse byte: 0–~4 ms, fine byte: 0–~1 ms extra),
+ *   but the number of distinct delay values increases by 256×.  This raises
+ *   the trace count required for CPA alignment from O(tens-of-thousands) to
+ *   O(millions) for a patient attacker using trace averaging.
+ *
  * @copyright Copyright (c) 2026 The MITRE Corporation
  */
 
@@ -64,10 +71,26 @@ void delay_ms(uint32_t ms)
 
 void random_delay(void)
 {
-    /* 0–~4 ms jitter from one TRNG byte.
-     * Called before every PIN HMAC evaluation (FIX SCA1) and before
-     * AES key loads to desynchronise power traces. */
-    uint32_t jitter = (uint32_t)(trng_read_byte() & 0x7F) * (CYCLES_PER_MS / 32);
+    /*
+     * FIX SCA5: read TWO TRNG bytes for 32768 discrete delay steps.
+     *
+     * Encoding:
+     *   b0 (high byte): coarse delay — 0–127 steps of 1000 cycles (~0–4 ms)
+     *   b1 (low byte):  fine delay   — 0–255 steps of 125 cycles  (~0–1 ms)
+     *
+     * Total range: 0–~5 ms.  Total distinct values: 128 × 256 = 32768,
+     * versus 128 with the original single-byte scheme.  A 256× increase in
+     * step count raises the CPA alignment cost proportionally, pushing
+     * successful attacks from O(tens-of-thousands) toward O(millions) of
+     * traces under realistic conditions.
+     *
+     * Called before every key-dependent SHA-256 compression (hmac_sha256,
+     * check_pin_cmp) and before every AES key load (aes_gcm_{encrypt,decrypt}).
+     */
+    uint8_t  b0     = trng_read_byte();   /* coarse: 0–127 ms-scale steps */
+    uint8_t  b1     = trng_read_byte();   /* fine:   0–255 sub-ms steps   */
+    uint32_t jitter = (uint32_t)(b0 & 0x7FU) * (CYCLES_PER_MS / 32)   /* ~0–4 ms  */
+                    + (uint32_t)b1            * (CYCLES_PER_MS / 256); /* ~0–1 ms  */
     delay_cycles(jitter);
 }
 

@@ -36,6 +36,15 @@
  *   mirrors hmac_verify()'s fault hardening: both evaluations must agree or
  *   security_halt() fires.
  *
+ * FIX FI3 (MEDIUM): The final tag accept/reject branch in aes_gcm_decrypt()
+ *   now uses `if (!(tag_ok1 & tag_ok2))` instead of `if (!tag_ok1)`, and
+ *   tag_ok1/tag_ok2 are declared volatile.  By the time this branch is
+ *   reached, the agreement check has already confirmed tag_ok1 == tag_ok2
+ *   (security_halt fires on disagreement), so the logical result is identical.
+ *   Using the bitwise AND of both volatile booleans means a glitch that
+ *   corrupts one boolean in a register cannot silently pass a failed tag —
+ *   the attacker would have to simultaneously corrupt both independent reads.
+ *
  * FIX SCA2 (MEDIUM): random_delay() is now called inside hmac_sha256()
  *   immediately before wc_HmacSetKey().  wc_HmacSetKey() is where wolfcrypt
  *   computes key XOR ipad and feeds it into the first SHA-256 compression —
@@ -246,7 +255,8 @@ static int aesadv_gcm_run(DL_AESADV_DIR    direction,
 
     DL_AESADV_Config cfg;
 
-    /* Build GCM IV = nonce || counter=1 (standard J0). */
+    /* Build GCM IV = nonce || counter=1 (standard J0).
+     * ARM LE: IV3 = 0x01000000 per TRM */
     memset(iv_buf, 0, sizeof(iv_buf));
     memcpy(iv_bytes, nonce, NONCE_SIZE);
     iv_bytes[15] = 0x01U;   /* ARM LE: IV3 = 0x01000000 per TRM */
@@ -359,9 +369,10 @@ int aes_gcm_encrypt(const uint8_t *key,
  *     cannot both be skipped by a single glitch pulse.  If hw_ret is still
  *     non-zero after the first skip, the second check fires and returns -1.
  *
- *   Tag comparison uses double-evaluated secure_compare() matching
- *   hmac_verify() fault hardening — security_halt() on disagreement.
- *   Plaintext zeroed on every failure path.
+ *   FIX FI3 (MEDIUM): tag_ok1 and tag_ok2 are volatile; final branch uses
+ *   `if (!(tag_ok1 & tag_ok2))`.  See file-level comment for rationale.
+ *
+ *   Plaintext zeroed on every failure path — no partial plaintext leaks.
  * ---------------------------------------------------------------------- */
 int aes_gcm_decrypt(const uint8_t *key,
                     const uint8_t *nonce,
@@ -370,10 +381,10 @@ int aes_gcm_decrypt(const uint8_t *key,
                     const uint8_t *tag,
                     uint8_t       *plaintext)
 {
-    uint8_t      computed_tag[TAG_SIZE];
-    bool         tag_ok1;
-    bool         tag_ok2;
-    volatile int hw_ret;   /* volatile: two independent loads guaranteed */
+    uint8_t       computed_tag[TAG_SIZE];
+    volatile bool tag_ok1;   /* FI3: volatile prevents compiler merging reads */
+    volatile bool tag_ok2;   /* FI3: volatile prevents compiler merging reads */
+    volatile int  hw_ret;    /* volatile: two independent loads guaranteed    */
 
     if (key == NULL || nonce == NULL || tag == NULL || plaintext == NULL) {
         return -1;
@@ -423,7 +434,13 @@ int aes_gcm_decrypt(const uint8_t *key,
         security_halt();
     }
 
-    if (!tag_ok1) {
+    /*
+     * FI3: bitwise AND of both volatile booleans.  The agreement check above
+     * guarantees tag_ok1 == tag_ok2 here, so the logical result is unchanged.
+     * A glitch corrupting one boolean after the agreement check still cannot
+     * silently accept a bad tag — both must be true for the AND to be true.
+     */
+    if (!(tag_ok1 & tag_ok2)) {
         secure_zero(plaintext,    ct_len);
         secure_zero(computed_tag, sizeof(computed_tag));
         return -1;
